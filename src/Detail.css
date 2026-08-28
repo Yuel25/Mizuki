@@ -70,6 +70,8 @@
 .progress-controls .mark-finished { border-color: #2b5040; background: #142519; color: #79d7aa; }
 .progress-controls .mark-finished:hover { border-color: #3f8a68; color: #a5e8c8; }
 
+.bangumi-link { margin-top: 16px; padding: 8px 12px; width: fit-content; font-size: 11px; }
+
 .detail-drawer .drawer-close {
   position: sticky;
   top: 0;

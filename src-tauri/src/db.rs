@@ -395,6 +395,37 @@ impl Database {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+    pub fn set_playback_path(&self, id: &str, path: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "UPDATE downloads SET playback_path=?2 WHERE id=?1",
+                params![id, path],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// (source, output_path, playback_path)：播放回退恢复会话时使用。
+    pub fn download_by_id(&self, id: &str) -> Result<Option<(String, String, Option<String>)>, String> {
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        match connection.query_row(
+            "SELECT source,output_path,playback_path FROM downloads WHERE id=?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        ) {
+            Ok(found) => Ok(Some(found)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
     pub fn restorable_downloads(&self) -> Result<Vec<(String, String, String)>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
         let mut query=connection.prepare("SELECT id,source,state FROM downloads WHERE state IN ('queued','downloading','paused')").map_err(|e|e.to_string())?;

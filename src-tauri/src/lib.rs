@@ -1251,7 +1251,7 @@ fn largest_video_file(handle: &ManagedTorrent) -> Option<String> {
 }
 
 #[tauri::command]
-fn download_playback_files(
+async fn download_playback_files(
     id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<PlaybackFile>, String> {
@@ -1262,63 +1262,113 @@ fn download_playback_files(
         .get(&id)
         .cloned();
     if let Some(handle) = handle {
-        if !handle.stats().finished {
-            return Err("下载尚未完成".into());
-        }
-        let mut files = handle
-            .with_metadata(|metadata| {
-                metadata
-                    .file_infos
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, file)| is_video_file(&file.relative_filename))
-                    .map(|(index, file)| {
-                        let path = handle.output_folder().join(&file.relative_filename);
-                        PlaybackFile {
-                            index,
-                            name: file
-                                .relative_filename
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| {
-                                    file.relative_filename.to_string_lossy().into_owned()
-                                }),
-                            size: file.len,
-                            path: path.to_string_lossy().into_owned(),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .map_err(|e| e.to_string())?;
-        if files.is_empty() {
-            return Err("该任务中没有可播放的视频文件".into());
-        }
-        // 多视频合集按文件名排序，选集时更像剧集列表。
-        files.sort_by(|a, b| a.name.cmp(&b.name));
-        return Ok(files);
+        return playback_files_from_handle(&handle);
     }
-    // 任务句柄不存在（应用重启后完成任务不恢复到会话）：回退到完成时落库的主视频路径。
-    let stored = state
-        .db
-        .list_downloads()?
-        .into_iter()
-        .find(|task| task.id == id)
-        .and_then(|task| task.playback_path)
-        .ok_or("任务不存在或尚未恢复，且没有已记录的视频路径")?;
-    let path = PathBuf::from(&stored);
-    if !path.is_file() {
-        return Err("视频文件不存在，可能已被移动或删除".into());
+    let (source, output_path, stored) =
+        state
+            .db
+            .download_by_id(&id)?
+            .ok_or("任务不存在")?;
+    // 完成时落库的主视频路径是最快的回退。
+    if let Some(stored) = stored {
+        let path = PathBuf::from(&stored);
+        if path.is_file() {
+            let size = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+            return Ok(vec![PlaybackFile {
+                index: 0,
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| stored.clone()),
+                size,
+                path: stored,
+            }]);
+        }
+        // 落库路径已失效（文件被移动），继续尝试恢复会话。
     }
-    let size = path.metadata().map(|meta| meta.len()).unwrap_or(0);
-    Ok(vec![PlaybackFile {
-        index: 0,
-        name: path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| stored.clone()),
-        size,
-        path: stored,
-    }])
+    restore_playback_files(&id, &source, &output_path, &state).await
+}
+
+/// 重启后完成任务不会回到下载会话。这里以暂停状态把种子重新装回会话读取文件清单：
+/// 需要联网获取元数据，并做一次磁盘校验（耗时与文件体积成正比）。
+/// 成功后句柄留在会话内，本次及后续播放不再重复恢复；主视频路径同时落库。
+async fn restore_playback_files(
+    id: &str,
+    source: &str,
+    output_path: &str,
+    state: &AppState,
+) -> Result<Vec<PlaybackFile>, String> {
+    let trackers = tracker_list(state).await;
+    let (_, torrent_input) =
+        prepare_torrent_input(source, &trackers, &state.client).await?;
+    let options = AddTorrentOptions {
+        overwrite: true,
+        paused: true,
+        output_folder: Some(output_path.to_owned()),
+        ..Default::default()
+    };
+    let response = state
+        .bt
+        .add_torrent(torrent_input, Some(options))
+        .await
+        .map_err(|e| format!("读取种子信息失败：{e}"))?;
+    let Some(handle) = response.into_handle() else {
+        return Err("下载引擎未能读取该种子".into());
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        handle.wait_until_initialized(),
+    )
+    .await
+    .map_err(|_| "读取种子信息超时，请稍后重试".to_string())?
+    .map_err(|e| format!("读取种子信息失败：{e}"))?;
+    state
+        .handles
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.to_owned(), handle.clone());
+    let files = playback_files_from_handle(&handle)?;
+    if let Some(largest) = largest_video_file(&handle) {
+        let _ = state.db.set_playback_path(id, &largest);
+    }
+    Ok(files)
+}
+
+fn playback_files_from_handle(handle: &ManagedTorrent) -> Result<Vec<PlaybackFile>, String> {
+    if !handle.stats().finished {
+        return Err("下载尚未完成".into());
+    }
+    let mut files = handle
+        .with_metadata(|metadata| {
+            metadata
+                .file_infos
+                .iter()
+                .enumerate()
+                .filter(|(_, file)| is_video_file(&file.relative_filename))
+                .map(|(index, file)| {
+                    let path = handle.output_folder().join(&file.relative_filename);
+                    PlaybackFile {
+                        index,
+                        name: file
+                            .relative_filename
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| {
+                                file.relative_filename.to_string_lossy().into_owned()
+                            }),
+                        size: file.len,
+                        path: path.to_string_lossy().into_owned(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .map_err(|e| e.to_string())?;
+    if files.is_empty() {
+        return Err("该任务中没有可播放的视频文件".into());
+    }
+    // 多视频合集按文件名排序，选集时更像剧集列表。
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
 }
 
 #[derive(serde::Serialize)]
