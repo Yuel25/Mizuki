@@ -1,9 +1,9 @@
 # Mizuki 项目交接文档
 
 > 最后更新：2026-08-28  
-> 当前版本：0.1.0  
+> 当前版本：0.2.0  
 > 目标平台：Windows x64  
-> 项目目录：`D:\projects\Mizuki`
+> 项目目录：`D:\projects\Mizuki`（已是 Git 仓库，main 分支）
 
 ## 1. 项目定位
 
@@ -13,9 +13,9 @@ Mizuki 是一款参考 Kazumi 与 Animeko 交互方式设计的 Windows 动漫�
 
 - 使用 Bangumi 提供番剧周表、条目资料、评分、简介和短评。
 - 默认使用本地 SQLite 管理“想看 / 在看 / 看过 / 搁置 / 抛弃”和观看进度。
-- 可选使用 Bangumi Personal Access Token 导入并同步个人收藏，不采用 OAuth 回调服务。
-- 使用 Mikan RSS 作为资源订阅入口。
-- 使用内置 librqbit 下载磁力链接或种子资源。
+- 可选使用 Bangumi Personal Access Token 导入并同步个人收藏（含观看集数写回），不采用 OAuth 回调服务。
+- 使用 Mikan RSS 作为资源订阅入口，支持每订阅匹配规则与自动下载。
+- 使用内置 librqbit 下载磁力链接或种子资源，支持限速、端口、连接数与并发排队。
 - 使用无边框窗口、自定义窗口控制按钮和系统托盘。
 
 ## 2. 技术栈
@@ -27,9 +27,9 @@ Mizuki 是一款参考 Kazumi 与 Animeko 交互方式设计的 Windows 动漫�
 - reqwest：Bangumi 与 RSS 网络请求
 - rusqlite：本地 SQLite 数据库
 - keyring：Windows 凭据管理器中的 Bangumi Access Token
-- librqbit：内置 BT 下载
+- librqbit：内置 BT 下载（会话限速、监听端口、UPnP）
 - rss：RSS 解析
-- Tauri tray、single-instance、opener 插件
+- Tauri tray、single-instance、opener、autostart、updater 插件
 
 ### 前端
 
@@ -42,142 +42,142 @@ Mizuki 是一款参考 Kazumi 与 Animeko 交互方式设计的 Windows 动漫�
 
 ```text
 Mizuki/
+├─ .github/workflows/         推送 v* 标签自动构建 Release 的 CI
+├─ .keys/                     Updater 签名密钥（已 gitignore，绝不能提交）
 ├─ assets/icon/              应用图标主图与多尺寸 PNG、ICO
 ├─ public/                   前端公开资源
 ├─ src/
-│  ├─ App.tsx               当前主要界面与前端业务逻辑
+│  ├─ App.tsx               全部界面与前端业务逻辑（含同步状态、规则编辑器、播放选集）
 │  ├─ App.css               主界面样式
 │  ├─ Frameless.css         无边框窗口、侧边栏、滚动条等样式
-│  ├─ Detail.css            详情页、短评、返回按钮样式
+│  ├─ Detail.css            详情页、短评、进度编辑、返回按钮样式
 │  ├─ Manager.css           RSS 与下载管理界面样式
-│  └─ DownloadExtras.css    手动添加下载等补充样式
+│  ├─ DownloadExtras.css    手动添加下载等补充样式
+│  ├─ RssGroups.css         RSS 分组与订阅规则编辑器样式
+│  ├─ Enhancements.css      搜索框、骨架屏、同步状态条等增量样式
+│  ├─ Theme.css             深色/浅色主题变量与覆盖
 ├─ src-tauri/
 │  ├─ capabilities/         Tauri 前端能力与本地路径访问权限
-│  ├─ src/lib.rs            Tauri 初始化、Commands、托盘、下载会话
-│  ├─ src/bangumi.rs        Bangumi API 封装和响应转换
-│  ├─ src/db.rs             SQLite 表结构与数据访问
+│  ├─ src/lib.rs            Tauri 初始化、Commands、托盘、下载会话、同步队列 worker、设置
+│  ├─ src/bangumi.rs        Bangumi API 封装和响应转换（含收藏分页/映射纯函数与测试）
+│  ├─ src/db.rs             SQLite 表结构与数据访问（含内存库测试）
 │  ├─ src/feeds.rs          RSS 获取与解析
 │  ├─ src/matcher.rs        RSS 标题匹配规则
-│  ├─ src/models.rs         Rust 数据模型
+│  ├─ src/models.rs         Rust 数据模型（Subject、RssFeed+FeedRule、DownloadTask 等）
 │  ├─ icons/                Tauri 打包图标
-│  └─ tauri.conf.json       窗口与 NSIS 打包配置
-├─ oauth-broker/            早期 OAuth 代理实验，当前桌面流程未使用
+│  └─ tauri.conf.json       窗口、CSP、updater 与 NSIS 打包配置
+├─ oauth-broker/            早期 OAuth 代理实验，当前桌面流程未使用（待归档或删除）
+├─ RELEASE.md               发布流程（版本号、签名、CI、Authenticode）
 ├─ README.md                项目使用和构建说明
 └─ HANDOFF.md               本交接文档
 ```
-
-注意：截至本文档更新时，`D:\projects\Mizuki` 不是 Git 仓库，执行 `git status` 会失败。继续开发前建议初始化 Git，并先提交当前可构建版本作为基线。
 
 ## 4. 当前已完成能力
 
 ### 4.1 应用图标与安装包
 
-- 已完成 Mizuki 月牙、播放轨道与下载箭头组合图标。
-- 已生成 16、24、32、48、64、128、256、512、1024 PNG。
-- 已生成 Windows `icon.ico`。
-- Tauri 和系统托盘使用应用图标。
-- 已配置 NSIS x64 安装包。
+- 已完成 Mizuki 月牙、播放轨道与下载箭头组合图标（多尺寸 PNG + ICO）。
+- 已配置 NSIS x64 安装包与 Updater 升级包签名（见 `RELEASE.md`）。
 
-当前安装包：
+安装包输出：
 
 ```text
-D:\projects\Mizuki\src-tauri\target\release\bundle\nsis\Mizuki_0.1.0_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Mizuki_0.2.0_x64-setup.exe
 ```
 
 ### 4.2 无边框窗口
 
-- `decorations: false`，取消系统标题栏。
-- 顶部存在透明拖拽区域。
-- 右上角提供最小化、最大化/还原、关闭按钮。
-- 关闭窗口默认隐藏到托盘。
-- 托盘菜单包含显示、暂停全部下载、退出。
-- 单实例启动时会显示并聚焦已有窗口。
-- 详情面板不再在右上角显示额外的关闭图标。
-- 详情面板左上角使用“← 返回”按钮，滚动时保持可见。
+- `decorations: false`，顶部透明拖拽区域，右上角最小化/最大化/关闭按钮。
+- 关闭窗口默认隐藏到托盘（可在设置中改为直接退出）；托盘菜单：显示、暂停全部下载、退出。
+- 单实例启动时显示并聚焦已有窗口；深浅色主题切换按钮。
+- 详情面板左上角“← 返回”按钮，滚动时保持可见。
 
 ### 4.3 Bangumi 番剧数据
 
 - 周表：`GET https://api.bgm.tv/calendar`
 - 条目详情：`GET https://api.bgm.tv/v0/subjects/{subject_id}`
+- 搜索：`POST https://api.bgm.tv/v0/search/subjects`（前端“搜索”页，350ms 防抖，失败时回退本地缓存匹配）
 - 用户信息：`GET https://api.bgm.tv/v0/me`
-- 用户收藏：`GET https://api.bgm.tv/v0/users/{username}/collections`
-- 写入收藏：`POST https://api.bgm.tv/v0/users/-/collections/{subject_id}`
+- 用户收藏：`GET https://api.bgm.tv/v0/users/{username}/collections`（分页对象 `{data,total,limit,offset}`）
+- 写入收藏：`POST https://api.bgm.tv/v0/users/-/collections/{subject_id}`（支持 `type` 与 `ep` 字段）
 - 短评：`GET https://next.bgm.tv/p1/subjects/{subject_id}/comments`
 
-条目详情打开时会补充：
-
-- 完整简介
-- `total_episodes` / `eps` 集数
-- 评分与排名
-- 高清封面
-- 短评用户头像、昵称、评分和正文
-
-周表接口经常缺失总集数。卡片遇到 `episodes == 0` 时会调用 `get_subject_detail` 补查集数。
+条目详情打开时补充完整简介、`total_episodes`/`eps` 集数、评分排名、高清封面与短评。
+周表卡片 `episodes == 0` 时按需补查，前端对同一 ID 的详情请求做去重合并。
 
 ### 4.4 Bangumi Access Token 同步
 
-- 设置页可打开 `https://next.bgm.tv/demo/access-token`。
-- 用户粘贴 Personal Access Token 后，先调用 `/v0/me` 验证。
-- Token 只保存在 Windows 凭据管理器：
-
-```text
-service: app.mizuki.desktop
-account: bangumi-access-token
-```
-
-- Token 不写入 SQLite、前端状态或普通配置文件。
-- 可分页导入动画收藏，每页 50 条。
-- 导入内容包括收藏状态、`ep_status` 和条目资料。
-- 收藏条目资料写入 `cached_subjects`，因此不在当前周表中的旧番也可以出现在“我的追番”。
-- 修改收藏状态时先写本地，然后后台写回 Bangumi。
+- 设置页可打开 `https://next.bgm.tv/demo/access-token`，粘贴 Token 后先经 `/v0/me` 验证。
+- Token 只保存在 Windows 凭据管理器（service `app.mizuki.desktop` / account `bangumi-access-token`）。
+- 分页导入动画收藏（每页 50 条），收藏条目资料写入 `cached_subjects`。
+- 收藏状态与观看集数改动：先写本地，再经**可靠同步队列**写回 Bangumi（见 4.5）。
 - 断开 Bangumi 只删除凭据，不删除本地收藏。
 
-### 4.5 本地数据库
+### 4.5 可靠同步队列（0.2.0 新增）
 
-数据库位于 Tauri 应用数据目录的 `mizuki.sqlite3`，由 `Database::open` 自动创建和迁移基础表。
+- `sync_queue` 表按 `subject_id` 去重，仅保留每条目最新改动；重新入队会重置退避计数。
+- 后台 worker 45 秒轮询 + 入队即时唤醒；写回失败按 2^n 分钟指数退避（2 分钟起步、60 分钟封顶）。
+- 设置页展示待同步数量、最近失败原因，提供“立即重试”（`retry_sync_now`）。
+- 侧栏头像处显示“N 条待同步”；未连接 Token 时保持本地模式，不入队。
+
+### 4.6 本地数据库
+
+数据库位于 Tauri 应用数据目录的 `mizuki.sqlite3`，由 `Database::open` 自动创建和迁移。
 
 当前表：
 
-- `rss_feeds`
+- `rss_feeds`（含 `rule_json` 每订阅规则）
 - `rss_items`
-- `downloads`
+- `downloads`（含 `source_key` 去重键）
 - `local_collections`
 - `cached_subjects`
-- `settings`
+- `settings`（含 `calendar_cache` 与 `app_settings`）
+- `sync_queue`
 
-其中：
+### 4.7 观看进度编辑（0.2.0 新增）
 
-- `local_collections` 保存条目 ID、收藏状态、观看集数和更新时间。
-- `cached_subjects` 保存 Bangumi 收藏返回的条目 JSON，支持追番页展示非周表条目。
+- 详情页进度区提供“− / ＋1 / 全部看完”按钮与集数直接输入。
+- `set_watch_progress` 命令先写本地，再带 `ep` 字段写回 Bangumi 的 `ep_status`。
+- 条目尚无收藏状态时首次标记进度自动视为“在看”。
 
-### 4.6 Mikan RSS 与下载
+### 4.8 Mikan RSS 与匹配规则
 
-- 可以填写 RSS URL 并验证、保存订阅源，应用启动时自动恢复列表和历史条目。
-- 支持单个/全部刷新、启用、停用、自动下载开关和删除订阅。
-- 首次添加订阅只建立历史基线，不会补下旧资源；后续刷新只处理新增 GUID。
-- 前端每 15 分钟自动刷新启用的订阅源。
-- 新资源可手动下载；启用自动下载后会自动进入 librqbit 队列。
-- 支持查看最近 RSS 资源、来源页面、发布时间及是否已经入队。
-- 支持 magnet、HTTP、HTTPS 种子来源，也可在下载页手动添加任务。
-- 下载页每 2 秒刷新进度、上下行速度和状态。
-- 支持暂停、继续、打开目录、移除任务，以及删除任务和文件。
-- “目录”按钮可打开系统下载目录下的 `Mizuki`；对应的 Tauri opener 权限仅放行 `$DOWNLOAD/Mizuki/**`。
-- 完成任务显示“▶ 播放”按钮，通过种子元数据查找该任务内体积最大的视频文件，并交给 Windows 默认播放器打开。
-- 可播放扩展名目前包括 `mkv`、`mp4`、`webm`、`avi`、`mov`、`m4v`、`ts`；找不到文件、文件被移动或系统打开失败时会显示错误提示。
-- 下载完成后自动暂停，停止做种。
-- 应用重启时会尝试恢复等待中、下载中和已暂停任务。
-- 托盘“暂停全部下载”已接入实际下载会话。
-- 下载目录为系统下载目录下的 `Mizuki`。
+- 可添加/验证/启停/删除订阅源；首次添加只建基线不补旧资源；刷新只处理新增 GUID。
+- 每订阅规则（0.2.0 新增）：必须包含、必须排除、分辨率、字幕组、自动下载开关，行内编辑器保存到 `rss_feeds.rule_json`。
+- 刷新发现的新资源按规则标记“符合规则”；开启自动下载的订阅会自动入队。
+- 下载页可查看来源、发布时间与任务状态，支持手动/批量下载。
 
-### 4.7 当前界面
+### 4.9 下载器（0.2.0 增强）
 
-侧边栏页面：
+- librqbit 会话：TCP+uTP 监听、UPnP、可配置端口（0 随机）、每任务连接数（默认 256）。
+- 上传/下载限速（KB/s，0 不限），保存后即时生效。
+- 同时下载数上限（0 不限）：超额新任务以排队状态入会话，任务完成/暂停/删除时自动续跑。
+- “下载完成后停止做种”可配置（默认开）。
+- 下载目录可自定义（对新任务生效，留空为系统下载目录\Mizuki）。
+- 完成任务“▶ 播放”：单视频直接打开；多视频弹出选集对话框（`download_playback_files` 按文件名排序）。
+- 目录/播放经 Rust 侧 `open_local_path` 打开，自定义目录不受 opener ACL 限制。
+- 应用重启自动恢复排队/下载/暂停任务。
 
-- 今日：按周一至周日查看 Bangumi 周表；当天处于“在看/想看”的收藏会单独显示在顶部“我的追番”区，其余条目显示在“今日全部”。
-- 追番：按想看、在看、看过、搁置、抛弃筛选。
-- RSS：添加 Mikan RSS。
-- 下载：展示任务、速度、进度和完成状态。
-- 设置：Bangumi Token、下载和后台选项。
+### 4.10 设置页（0.2.0 起全部真实生效）
+
+全部设置以 JSON 存 `settings` 表（key=`app_settings`），字段缺省自动回落默认值：
+
+| 设置 | 生效方式 |
+|---|---|
+| 下载目录 | 新任务生效 |
+| 下载/上传限速 | 即时 |
+| BT 端口、每任务连接数 | 重启生效（UI 有标注） |
+| 同时下载数 | 即时 |
+| 完成后停止做种 | 即时 |
+| RSS 刷新间隔（5-1440 分钟） | 即时（前端轮询间隔跟随） |
+| 开机自启动 | 即时（autostart 插件） |
+| 关闭窗口最小化到托盘 | 即时 |
+| 收藏数据展示 | 依据是否连接 Token |
+
+### 4.11 当前界面
+
+侧边栏页面：今日（周表 + 置顶“我的追番”）、搜索、追番（五状态筛选）、RSS（订阅 + 规则 + 资源）、下载、设置。
+数据等待时显示 shimmer 骨架卡片；浏览器预览显示明确“需在桌面端运行”提示，不再展示演示数据。
 
 ## 5. 关键实现约定
 
@@ -191,160 +191,92 @@ account: bangumi-access-token
 | `on_hold` | 4 | 搁置 |
 | `dropped` | 5 | 抛弃 |
 
+映射唯一来源：`bangumi::collection_slug` / `collection_kind`（有互逆测试）。
+
 ### 5.2 星期映射
 
-前端使用：
-
-```text
-0 周一 ... 6 周日
-```
-
-Bangumi 周表返回的 weekday ID 会在 `bangumi::calendar` 中转换为上述格式。缓存收藏条目如果没有周表信息，`air_weekday` 为 `-1`，仅用于追番页，不会进入任意星期分类。
+前端 `0 周一 ... 6 周日`；`bangumi::calendar` 负责 Bangumi weekday ID 转换。
+缓存收藏条目 `air_weekday` 为 -1，仅用于追番页。
 
 ### 5.3 前后端字段
 
-Rust 模型使用 `#[serde(rename_all = "camelCase")]`，前端主要字段包括：
+Rust 模型 `#[serde(rename_all = "camelCase")]`，主要字段：
+`nameCn, airWeekday, updateState, downSpeed, outputPath, lastCheckedAt, matchesRule, autoDownload, subtitleGroup`。
+Bangumi 原始详情与短评按 API 原字段直传（`total_episodes, rating.score` 等）。
 
-```text
-nameCn, airWeekday, updateState, downSpeed, outputPath, lastCheckedAt
-```
+### 5.4 测试
 
-Bangumi 原始详情与短评作为 JSON 直接返回时仍使用 API 原字段，例如：
-
-```text
-total_episodes, rating.score, rating.rank
-```
+`cargo test --locked` 共 26 个测试：下载源去重键、magnet tracker 合并、会话选项、
+收藏分页对象/旧数组形状防回归、收藏映射互逆、周表合并（收藏注入/缓存去重/无收藏隐藏）、
+数据库 upsert/缓存往返/同步队列退避、RSS 嵌套 pubDate、标题匹配规则、设置校验。
 
 ## 6. 已解决问题记录
 
-- 生成并接入多尺寸应用与托盘图标。
-- 修复无边框窗口无法拖拽。
-- 增加右上角最小化、最大化、关闭按钮。
-- 修复托盘图标缺失。
-- 将不协调的白色滚动条改为紫色主题滚动条。
-- 放弃需要应用密钥和回调端口的 Bangumi OAuth 方案。
-- 改用 Kazumi 风格的 Personal Access Token。
-- 修复 Bangumi 收藏接口错误按数组解析的问题；实际返回分页对象 `{ data, total, limit, offset }`。
-- 修复周表简介为空：详情打开时调用 `/v0/subjects/{id}`。
-- 修复总集数缺失：兼容 `total_episodes`、`eps`、`eps_count`，并对卡片按需补查。
-- 修复短评接口 404：原 `/v0/subjects/{id}/comments` 不存在，改为当前可用的 `/p1/subjects/{id}/comments`。
-- 修复详情关闭按钮和窗口按钮在右上角堆叠。
-- 将“今日”页中的在看/想看番剧提取为独立置顶区块，避免在完整周表中查找收藏。
-- 修复下载任务“目录”按钮无响应：补充受下载目录范围限制的 `opener:allow-open-path` 权限，并在前端捕获错误。
-- 为完成任务增加“播放”按钮；新增 `download_playback_path` Command，使用对应 librqbit 任务的元数据定位主视频，避免误开字幕或 sample 文件。
+（0.1.0 记录略，见 Git 历史 `f4158c8` 前的基线。）
+
+0.2.0 新增：
+
+- 收藏写回失败不再被静默忽略：sync_queue + 指数退避 + UI 重试入口。
+- 观看进度可编辑并同步 Bangumi `ep_status`。
+- RSS 匹配规则接入订阅 UI，规则可自动下载。
+- 下载器限速/端口/连接数/并发排队/自定义目录/停止做种全部可配置。
+- 播放从“最大文件”策略升级为选集对话框。
+- 设置页静态展示全部改为真实落库生效。
+- 移除演示数据，加载骨架 + 明确的预览/离线提示。
+- CSP 从 `null` 收紧为白名单；日志审计无 Token 泄漏。
+- 初始化 Git 并以 0.1.0 基线起步，逐项提交。
 
 ## 7. 已知问题与未完成项
 
-以下能力尚未达到可发布状态：
-
-### 高优先级
-
-1. Bangumi 写回错误被后台任务忽略
-   - `set_collection` 会先成功写本地，再 spawn 写回 Bangumi。
-   - 写回失败目前没有重试队列、状态标记或 UI 提示。
-   - 建议恢复可靠的 `sync_queue`，实现指数退避、失败提示和手动重试。
-
-2. 观看进度不可编辑
-   - UI 只显示 `watched / episodes`。
-   - 尚无“看完一集”、集数选择器或 Bangumi episode collection 写回。
-
-3. 集数按卡片逐个请求
-   - 一个星期可见条目较多时会产生多次详情请求。
-   - 建议后端增加详情缓存、并发限制和失效时间，或改用批量季度数据源。
-
-4. 短评使用 Bangumi Private API
-   - `/p1/` 接口当前真实可用，但属于私有 API，兼容性不如 `/v0/`。
-   - 请求失败时应提供跳转 Bangumi 网页的降级方案。
-
-### 中优先级
-
-5. RSS 高级匹配规则尚未接入设置界面
-   - 基础订阅、增量刷新和自动下载已经闭环。
-   - `matcher.rs` 已有包含、排除、分辨率和字幕组匹配器，但尚未为每个订阅保存规则，也没有规则编辑界面。
-
-6. 下载器仍缺少高级 BT 设置
-   - 基础添加、恢复、暂停、继续、播放、删除和目录打开已经闭环。
-   - 尚未提供限速、连接数、端口、代理、文件选择和下载优先级。
-
-7. 播放依赖活动下载任务的 librqbit 元数据
-   - `download_playback_path` 从内存中的 `ManagedTorrent` 获取文件清单。
-   - 如果历史完成任务未成功恢复到下载会话，会提示“任务不存在或尚未恢复”。
-   - 多视频合集目前默认打开体积最大的文件，尚无剧集/文件选择界面。
-
-8. 设置项多为静态展示
-   - 下载目录选择、并发数、停止做种、刷新间隔、开机启动均未保存或生效。
-   - UI 当前正确展示“系统下载目录\\Mizuki”，但尚不支持用户修改目录。
-
-9. 前端仍包含演示数据
-   - Bangumi 或 Tauri Command 请求失败时会保留 `demoSubjects`、`demoDownloads`。
-   - 发布前应改为空状态或明确标记演示模式，避免用户将假数据误认为真实数据。
-
-### 工程化
-
-10. 当前目录不是 Git 仓库。
-11. 没有端到端测试和前端组件测试。
-12. Rust 文件中部分代码为高度压缩的单行形式，建议格式化和拆分。
-13. `oauth-broker/` 已废弃但仍保留，应决定归档或删除。
-14. `tauri-plugin-deep-link` 已配置 `mizuki://`，但当前业务未使用。
-15. CSP 当前为 `null`，发布前应配置网络和图片来源白名单。
+1. 集数仍按卡片逐个补查
+   - 前端已对同一 ID 去重合并，但可见卡片多时仍是多次详情请求。
+   - 建议后端加详情缓存（TTL + 并发限制）或改用批量季度数据源。
+2. 短评使用 Bangumi 私有 `/p1/` 接口
+   - 当前可用但兼容性弱于 `/v0/`；失败时应提供跳转 Bangumi 网页的降级。
+3. Updater 已接入但无“检查更新”界面
+   - `tauri-plugin-updater` 已注册并在 Release CI 中签名；设置页需补 `check()` 调用与提示 UI。
+4. 观看进度写回粒度
+   - `ep` 是集数计数而非具体 episode id；对使用绝对编号的条目可能与 Bangumi 章节不完全一致。
+5. 文件级下载选择未实现
+   - librqbit 9 的 `update_only_files` 为 crate 私有，只能在添加任务时通过 `only_files` 指定；
+     当前未暴露“添加前预览种子文件并勾选”的流程。
+6. `tauri-plugin-deep-link` 已配置 `mizuki://`，业务未使用。
+7. `oauth-broker/` 已废弃但仍保留，应决定归档或删除。
+8. 播放路径依赖内存中的任务句柄
+   - 历史完成任务若未成功恢复到会话，会提示“任务不存在或尚未恢复”。
+9. 无端到端/UI 测试；Rust 侧仍有部分压缩单行风格代码（`App.tsx`、`db.rs` 个别语句）。
 
 ## 8. 建议后续开发顺序
 
-1. 初始化 Git，提交当前可构建基线。
-2. 增加后端 API/数据库集成测试，重点覆盖收藏分页响应和缓存合并。
-3. 完成观看进度编辑及 Bangumi 章节同步。
-4. 建立可靠同步队列与前端同步状态提示。
-5. 为 RSS 增加每订阅的字幕组、分辨率、语言和排除规则界面。
-6. 为下载器增加限速、代理、端口、文件选择和优先级设置。
-7. 让设置页所有选项真实落库并生效。
-8. 清除演示数据，完善加载骨架、错误提示和离线状态。
-9. 配置 CSP、日志脱敏、崩溃恢复和正式版本号。
-10. 补充签名、升级与发布流程。
+1. 设置页接入“检查更新”（`@tauri-apps/plugin-updater`），配合 Release CI 验证一次真实升级。
+2. 后端条目详情缓存（TTL），消除周表卡片 N+1 请求。
+3. 短评接口失败时降级跳转 Bangumi 网页。
+4. 为同步队列补一个真实 Bangumi 写回的集成测试（可用 staging token）。
+5. 归档/删除 `oauth-broker/`，移除未用的 deep-link 配置。
+6. 压缩单行代码格式化拆分（`cargo fmt` + prettier）。
+7. 补端到端测试（如 WebDriver/tauri-driver）覆盖收藏与下载主流程。
 
 ## 9. 开发与构建
 
-环境要求：
-
-- Node.js 20+
-- Rust 1.85+
-- Windows WebView2
-- NSIS（Tauri 构建流程当前环境已可用）
-
-安装依赖并启动：
+环境要求：Node.js 20+、Rust 1.85+、Windows WebView2、NSIS。
 
 ```powershell
 cd D:\projects\Mizuki
 npm install
-npm run tauri dev
+npm run tauri dev      # 开发
+npm run build          # 仅前端
+cd src-tauri; cargo test --locked   # Rust 测试
+cd ..; npm run tauri build          # Windows 安装包
 ```
 
-仅构建前端：
+发布流程（版本号、签名、CI、Authenticode）见 `RELEASE.md`。
 
-```powershell
-npm run build
-```
+最近一次验证结果（2026-08-28，0.2.0）：
 
-检查 Rust：
-
-```powershell
-cd D:\projects\Mizuki\src-tauri
-cargo check --locked
-```
-
-生成 Windows 安装包：
-
-```powershell
-cd D:\projects\Mizuki
-npm run tauri build
-```
-
-最近一次验证结果：
-
-- `npm run build`：通过（2026-08-28）
-- `cargo check`：通过（2026-08-28）
-- `npm run tauri build`：通过（2026-08-28）
-- Release 可执行文件：`D:\projects\Mizuki\src-tauri\target\release\mizuki.exe`
-- NSIS 安装包：`D:\projects\Mizuki\src-tauri\target\release\bundle\nsis\Mizuki_0.1.0_x64-setup.exe`
+- `npm run build`：通过
+- `cargo test --locked`：26 passed
+- `npm run tauri build`：通过
+- 安装包：`src-tauri\target\release\bundle\nsis\Mizuki_0.2.0_x64-setup.exe`
 
 ## 10. 外部接口与参考资料
 
@@ -355,17 +287,18 @@ npm run tauri build
 - Mikan Project：https://mikanani.me/
 - Kazumi：https://github.com/Predidit/Kazumi
 - Animeko：https://github.com/open-ani/animeko
+- librqbit：https://github.com/IgnisDa/rqbit
+- Tauri Updater：https://v2.tauri.app/plugin/updater/
 
 ## 11. 交接检查清单
 
-- [ ] 安装当前 NSIS 包并确认能启动。
-- [ ] 检查无边框窗口拖拽、最小化、最大化和关闭到托盘。
-- [ ] 在设置页验证 Bangumi Access Token。
-- [ ] 点击“立即同步收藏”，确认各分类数量和观看集数。
-- [ ] 打开周表条目，确认简介、总集数和短评。
-- [ ] 添加一个 Mikan RSS，确认数据库写入。
-- [ ] 添加测试磁力任务，确认速度和进度刷新。
-- [ ] 下载完成后点击“目录”，确认资源管理器打开 `下载\Mizuki`。
-- [ ] 下载完成后点击“▶ 播放”，确认 Windows 默认播放器打开正确视频。
-- [ ] 使用包含多个视频的合集种子验证“最大文件”默认策略是否符合预期。
-- [ ] 初始化 Git 并提交基线。
+- [ ] 安装 0.2.0 NSIS 包并确认能启动。
+- [ ] 检查无边框窗口拖拽、最小化、最大化和关闭到托盘（并验证设置中关闭行为切换）。
+- [ ] 在设置页验证 Bangumi Access Token，确认侧栏与设置页同步状态展示。
+- [ ] 修改收藏状态后断网，确认“待同步”计数增加；恢复网络或点“立即重试”后清零。
+- [ ] 打开周表条目，用“＋1/全部看完”编辑进度，确认 Bangumi 端 `ep_status` 更新。
+- [ ] 搜索页搜索并添加条目到收藏。
+- [ ] 添加一个 Mikan RSS，配置规则（含字幕组/分辨率）并开启自动下载，确认新资源自动入队。
+- [ ] 设置限速与同时下载数，添加多个任务确认排队与续跑。
+- [ ] 下载完成后点击“目录”打开实际下载目录；多视频任务确认弹出选集对话框。
+- [ ] （有 GitHub 远端后）推 v0.2.1 标签验证 Release CI 产出签名升级包。
