@@ -45,6 +45,31 @@
 .episode-total { margin: 8px 0 0; font-size: 10px; }
 .detail-error { display: block; margin-top: 8px; color: #ff8597; }
 
+.progress-controls { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.progress-controls button,
+.progress-controls input {
+  padding: 7px 11px;
+  border: 1px solid #343041;
+  border-radius: 8px;
+  background: #17151f;
+  color: #c8c2d2;
+  font-size: 11px;
+  cursor: pointer;
+}
+.progress-controls input {
+  width: 64px;
+  text-align: center;
+  cursor: text;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.progress-controls input::-webkit-outer-spin-button,
+.progress-controls input::-webkit-inner-spin-button { margin: 0; appearance: none; -webkit-appearance: none; }
+.progress-controls button:disabled { opacity: 0.45; cursor: default; }
+.progress-controls button:not(:disabled):hover { border-color: #7047d9; color: #fff; }
+.progress-controls .mark-finished { border-color: #2b5040; background: #142519; color: #79d7aa; }
+.progress-controls .mark-finished:hover { border-color: #3f8a68; color: #a5e8c8; }
+
 .detail-drawer .drawer-close {
   position: sticky;
   top: 0;

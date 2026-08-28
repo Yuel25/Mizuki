@@ -159,21 +159,27 @@ pub fn collection_page_data(page: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// `ep` 传 `Some` 时同步观看进度到 Bangumi 的 `ep_status`；`None` 表示不改集数。
 pub async fn set_collection(
     client: &reqwest::Client,
     token: &str,
     subject_id: i64,
     collection: &str,
+    ep: Option<i64>,
 ) -> Result<(), String> {
     let Some(kind) = collection_kind(collection) else {
         return Err("收藏状态无效".into());
     };
+    let mut body = serde_json::json!({"type": kind});
+    if let Some(ep) = ep {
+        body["ep"] = ep.into();
+    }
     client
         .post(format!(
             "https://api.bgm.tv/v0/users/-/collections/{subject_id}"
         ))
         .bearer_auth(token)
-        .json(&serde_json::json!({"type":kind}))
+        .json(&body)
         .send()
         .await
         .map_err(|e| e.to_string())?

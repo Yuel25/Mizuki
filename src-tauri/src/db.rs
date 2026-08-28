@@ -373,6 +373,18 @@ impl Database {
         self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO local_collections(subject_id,collection,watched,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(subject_id) DO UPDATE SET collection=excluded.collection,watched=excluded.watched,updated_at=excluded.updated_at",params![subject_id,collection,watched,chrono::Utc::now().to_rfc3339()]).map_err(|e|e.to_string())?;
         Ok(())
     }
+    pub fn collection_state(&self, subject_id: i64) -> Result<Option<(String, i64)>, String> {
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        match connection.query_row(
+            "SELECT collection,watched FROM local_collections WHERE subject_id=?1",
+            [subject_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ) {
+            Ok(state) => Ok(Some(state)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
     pub fn collections(&self) -> Result<HashMap<i64, (String, i64)>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
         let mut query = connection

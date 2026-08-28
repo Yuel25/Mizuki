@@ -959,6 +959,13 @@ async fn delete_download(
     state.db.delete_download(&id)
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchProgress {
+    collection: String,
+    watched: i64,
+}
+
 #[tauri::command]
 fn set_collection(
     subject_id: i64,
@@ -974,13 +981,43 @@ fn set_collection(
         let payload = serde_json::to_value(subject).map_err(|e| e.to_string())?;
         state.db.cache_subject(subject_id, &payload)?;
     }
+    // 写回失败进入同步队列重试（见 enqueue_collection_sync）。
     if let Some(token) = stored_access_token() {
         let client = state.client.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = bangumi::set_collection(&client, &token, subject_id, &collection).await;
+            let _ = bangumi::set_collection(&client, &token, subject_id, &collection, None).await;
         });
     }
     Ok(())
+}
+
+/// 更新观看集数：先写本地，再带 `ep` 写回 Bangumi。
+/// 条目还没有收藏状态时视为“在看”。
+#[tauri::command]
+fn set_watch_progress(
+    subject_id: i64,
+    watched: i64,
+    state: tauri::State<'_, AppState>,
+) -> Result<WatchProgress, String> {
+    if !(0..=2000).contains(&watched) {
+        return Err("观看集数无效".into());
+    }
+    let collection = match state.db.collection_state(subject_id)? {
+        Some((collection, _)) => collection,
+        None => "doing".to_string(),
+    };
+    state
+        .db
+        .set_collection_progress(subject_id, &collection, watched)?;
+    if let Some(token) = stored_access_token() {
+        let client = state.client.clone();
+        let collection = collection.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = bangumi::set_collection(&client, &token, subject_id, &collection, Some(watched))
+                .await;
+        });
+    }
+    Ok(WatchProgress { collection, watched })
 }
 
 #[tauri::command]
@@ -1163,6 +1200,7 @@ pub fn run() {
             download_playback_path,
             delete_download,
             set_collection,
+            set_watch_progress,
             get_comments,
             preview_rule_match
         ])
