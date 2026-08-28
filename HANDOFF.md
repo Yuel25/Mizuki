@@ -309,12 +309,13 @@ cd ..; npm run tauri build          # Windows 安装包
 
 发布流程（版本号、签名、CI、Authenticode）见 `RELEASE.md`。
 
-最近一次验证结果（2026-08-28，0.2.0）：
+最近一次验证结果（2026-08-28，0.2.1）：
 
 - `npm run build`：通过
-- `cargo test --locked`：26 passed
+- `cargo test --locked`：27 passed
 - `npm run tauri build`：通过
-- 安装包：`src-tauri\target\release\bundle\nsis\Mizuki_0.2.0_x64-setup.exe`
+- 安装包：`src-tauri\target\release\bundle\nsis\Mizuki_0.2.1_x64-setup.exe`
+- Release CI：v0.2.1 签名发布链路验证通过（安装包 + .sig + latest.json）
 
 ## 10. 外部接口与参考资料
 
