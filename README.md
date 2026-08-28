@@ -41,3 +41,7 @@ Windows 安装程序输出于 `src-tauri/target/release/bundle/nsis/`。发布�
 - Mikan 只接收用户粘贴的 RSS 地址，不保存 Mikan 密码。
 - RSS 新资源默认只发现不下载；开启自动下载的订阅按规则处理新增条目。
 - 用户应确保下载内容符合所在地法律与资源授权。
+
+## 许可
+
+Mizuki 以 [MIT](LICENSE) 协议开源。
