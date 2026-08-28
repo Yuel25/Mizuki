@@ -19,3 +19,10 @@
 .play-files button:hover{border-color:#7047d9;color:#fff}
 .play-files button small{flex:none;color:#756e80;font-size:9px}
 @media(max-width:1050px){.setting-row.field-row{grid-template-columns:minmax(0,1fr) 140px}}
+.skeleton-card{min-width:0}
+.skeleton{position:relative;overflow:hidden;background:#1c1928;border-radius:8px}
+.skeleton::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,#ffffff0f,transparent);animation:mizuki-shimmer 1.4s infinite}
+.cover-sk{height:238px;border-radius:13px}
+.line-sk{height:12px;margin:8px 0 0}
+.line-sk.short{width:55%}
+@keyframes mizuki-shimmer{to{transform:translateX(100%)}}

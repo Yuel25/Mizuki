@@ -83,3 +83,5 @@
 :root[data-theme="light"] .setting-row.field-row input[type=number],:root[data-theme="light"] .setting-row.field-row input:not([type=checkbox]){border-color:#d7d0df;background:#fff;color:#302a38}
 :root[data-theme="light"] .play-files button{border-color:#d9d3e2;background:#fff;color:#4c4656}
 :root[data-theme="light"] .play-files button small{color:#898291}
+:root[data-theme="light"] .skeleton{background:#e9e5f0}
+:root[data-theme="light"] .skeleton::after{background:linear-gradient(90deg,transparent,#ffffffcc,transparent)}
