@@ -784,12 +784,10 @@ fn active_download_count(state: &AppState) -> usize {
 }
 
 /// 有空闲槽位时把排队的任务（paused 句柄 + queued 状态）继续启动。
+/// max_concurrent_downloads=0 表示不限，此时所有排队任务都直接启动。
 fn promote_queued_downloads(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
     let settings = state.settings();
-    if settings.max_concurrent_downloads == 0 {
-        return;
-    }
     let Ok(tasks) = state.db.list_downloads() else {
         return;
     };
@@ -802,7 +800,11 @@ fn promote_queued_downloads(app: &tauri::AppHandle) {
         .iter()
         .filter(|task| handles.contains_key(&task.id) && task.state == "downloading")
         .count() as i64;
-    let mut slots = settings.max_concurrent_downloads as i64 - active;
+    let mut slots = if settings.max_concurrent_downloads == 0 {
+        i64::MAX
+    } else {
+        settings.max_concurrent_downloads as i64 - active
+    };
     for task in tasks.iter().filter(|task| task.state == "queued") {
         if slots <= 0 {
             break;
@@ -914,7 +916,15 @@ async fn start_download(
                 .lock()
                 .map_err(|e| e.to_string())?
                 .insert(task.id.clone(), handle);
-            task.state = if add_paused { "queued" } else { "downloading" }.into();
+            // 用户手动暂停的任务保持 paused（不被排队逻辑吞掉）；
+            // 超出并发限制的新任务以 queued 等待 promote 续跑。
+            task.state = if restore_paused {
+                "paused".into()
+            } else if add_paused {
+                "queued".into()
+            } else {
+                "downloading".into()
+            };
             state.db.set_download_state(&task.id, &task.state)?;
             Ok(task)
         }
@@ -1216,6 +1226,9 @@ async fn delete_download(
     }
     state.db.reset_rss_download_for_task(&id)?;
     state.db.delete_download(&id)?;
+    if let Ok(mut samples) = state.speed_samples.lock() {
+        samples.remove(&id);
+    }
     promote_queued_downloads(&app);
     Ok(())
 }
@@ -1650,28 +1663,38 @@ pub fn run() {
             let restore_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = restore_app.state::<AppState>();
-                let restore_output_folder = state.download_dir().to_string_lossy().into_owned();
                 let _guard = state.download_gate.lock().await;
                 // 后台预热 TrackerList，避免第一次手动下载被网络探测阻塞。
                 let trackers = tracker_list(&state).await;
                 if let Ok(tasks) = state.db.restorable_downloads() {
-                    for (id, source, previous_state) in tasks {
+                    for (id, source, previous_state, output_path) in tasks {
+                        // 全部以暂停装入，之后由 promote_queued_downloads 按
+                        // “同时下载数”设置统一续跑；重启不得绕过并发限制。
                         let options = AddTorrentOptions {
                             overwrite: true,
-                            output_folder: Some(restore_output_folder.clone()),
+                            paused: true,
+                            output_folder: Some({
+                                let dir = PathBuf::from(&output_path);
+                                if output_path.is_empty() || !dir.is_absolute() {
+                                    state.download_dir().to_string_lossy().into_owned()
+                                } else {
+                                    output_path.clone()
+                                }
+                            }),
                             trackers: (!source.starts_with("magnet:") && !trackers.is_empty())
                                 .then_some(trackers.clone()),
                             ..Default::default()
                         };
+                        if previous_state == "downloading" {
+                            // 恢复后统一走排队调度。
+                            let _ = state.db.set_download_state(&id, "queued");
+                        }
                         let input = prepare_torrent_input(&source, &trackers, &state.client).await;
                         match input {
                             Ok((_, torrent_input)) => {
                                 match state.bt.add_torrent(torrent_input, Some(options)).await {
                                     Ok(response) => {
                                         if let Some(handle) = response.into_handle() {
-                                            if previous_state == "paused" {
-                                                let _ = state.bt.pause(&handle).await;
-                                            }
                                             if let Ok(mut handles) = state.handles.lock() {
                                                 handles.insert(id, handle);
                                             }
@@ -1689,6 +1712,7 @@ pub fn run() {
                             }
                         }
                     }
+                    promote_queued_downloads(&restore_app);
                 }
             });
 
@@ -1726,7 +1750,22 @@ pub fn run() {
                                         .collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default();
+                            // 只暂停真正进行中/排队的任务；已完成任务（如播放回退恢复的）
+                            // 保持 completed，避免下次重启被当作未完成做无谓校验。
+                            let pausable: std::collections::HashSet<String> = state
+                                .db
+                                .list_downloads()
+                                .unwrap_or_default()
+                                .iter()
+                                .filter(|task| {
+                                    task.state == "downloading" || task.state == "queued"
+                                })
+                                .map(|task| task.id.clone())
+                                .collect();
                             for (id, handle) in handles {
+                                if !pausable.contains(&id) {
+                                    continue;
+                                }
                                 if state.bt.pause(&handle).await.is_ok() {
                                     let _ = state.db.set_download_state(&id, "paused");
                                 }

@@ -426,11 +426,19 @@ impl Database {
             Err(error) => Err(error.to_string()),
         }
     }
-    pub fn restorable_downloads(&self) -> Result<Vec<(String, String, String)>, String> {
+    /// (id, source, state, output_path)：重启恢复下载会话时使用。
+    pub fn restorable_downloads(&self) -> Result<Vec<(String, String, String, String)>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
-        let mut query=connection.prepare("SELECT id,source,state FROM downloads WHERE state IN ('queued','downloading','paused')").map_err(|e|e.to_string())?;
+        let mut query=connection.prepare("SELECT id,source,state,output_path FROM downloads WHERE state IN ('queued','downloading','paused')").map_err(|e|e.to_string())?;
         query
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
