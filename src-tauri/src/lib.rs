@@ -321,11 +321,23 @@ async fn add_rss_feed(url: String, state: tauri::State<'_, AppState>) -> Result<
         url,
         enabled: true,
         last_checked_at: Some(chrono::Utc::now().to_rfc3339()),
-        auto_download: false,
+        rule: models::FeedRule::default(),
     };
     state.db.add_feed(&feed)?;
     state.db.insert_rss_items(&feed.id, &items)?;
     Ok(feed)
+}
+
+#[tauri::command]
+fn set_rss_feed_rules(
+    id: String,
+    rule: models::FeedRule,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if rule.includes.len() > 20 || rule.excludes.len() > 20 {
+        return Err("规则关键词过多（最多 20 个）".into());
+    }
+    state.db.update_feed_rule(&id, &rule)
 }
 
 #[tauri::command]
@@ -343,9 +355,18 @@ fn list_rss_items(
         .db
         .list_rss_items(feed_id.as_deref(), limit.unwrap_or(100).min(500))?;
     let handles = state.handles.lock().map_err(|e| e.to_string())?;
+    let rules: HashMap<String, models::FeedRule> = state
+        .db
+        .list_feeds()?
+        .into_iter()
+        .map(|feed| (feed.id.clone(), feed.rule))
+        .collect();
     for item in &mut items {
         if let Some(download) = &mut item.download {
             download.active = handles.contains_key(&download.task_id);
+        }
+        if let Some(rule) = rules.get(&item.feed_id) {
+            item.matches_rule = matcher::resource_matches(&item.title, &rule.into());
         }
     }
     Ok(items)
@@ -672,6 +693,24 @@ async fn refresh_feed(feed: &RssFeed, state: &AppState) -> Result<Vec<RssItem>, 
     let now = chrono::Utc::now().to_rfc3339();
     let inserted = state.db.insert_rss_items(&feed.id, &items)?;
     state.db.update_feed(&feed.id, &title, &now)?;
+    if feed.rule.auto_download {
+        let rule = (&feed.rule).into();
+        for item in &inserted {
+            if !matcher::resource_matches(&item.title, &rule) {
+                continue;
+            }
+            let Some(source) = rss_download_source(item) else {
+                continue;
+            };
+            // 单条失败不影响其余资源；失败任务会留在 RSS 列表里可手动重试。
+            match start_download(source, item.title.clone(), "RSS 自动下载".into(), state).await {
+                Ok(task) => {
+                    let _ = state.db.mark_rss_downloaded(&item.guid, &task.id);
+                }
+                Err(error) => eprintln!("RSS 自动下载失败（{}）：{error}", item.title),
+            }
+        }
+    }
     Ok(inserted)
 }
 
@@ -1272,6 +1311,7 @@ pub fn run() {
             list_rss_feeds,
             list_rss_items,
             set_rss_feed_enabled,
+            set_rss_feed_rules,
             delete_rss_feed,
             refresh_rss_feed,
             refresh_all_rss_feeds,

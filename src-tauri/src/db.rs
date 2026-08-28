@@ -68,6 +68,18 @@ impl Database {
                 .execute("ALTER TABLE downloads ADD COLUMN source_key TEXT", [])
                 .map_err(|e| e.to_string())?;
         }
+        let has_feed_rule: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('rss_feeds') WHERE name='rule_json'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if has_feed_rule == 0 {
+            connection
+                .execute("ALTER TABLE rss_feeds ADD COLUMN rule_json TEXT", [])
+                .map_err(|e| e.to_string())?;
+        }
         // 旧版本保存的是完整磁力链接。统一迁移为 info-hash，避免升级后重复创建任务。
         let download_sources = {
             let mut query = connection
@@ -114,21 +126,25 @@ impl Database {
     }
 
     pub fn add_feed(&self, feed: &RssFeed) -> Result<(), String> {
-        self.0.lock().map_err(|e| e.to_string())?.execute("INSERT INTO rss_feeds(id,title,url,enabled,last_checked_at,auto_download) VALUES(?1,?2,?3,?4,?5,?6)", params![feed.id,feed.title,feed.url,feed.enabled,feed.last_checked_at,feed.auto_download]).map_err(|e| e.to_string())?;
+        let rule = serde_json::to_string(&feed.rule).map_err(|e| e.to_string())?;
+        self.0.lock().map_err(|e| e.to_string())?.execute("INSERT INTO rss_feeds(id,title,url,enabled,last_checked_at,rule_json) VALUES(?1,?2,?3,?4,?5,?6)", params![feed.id,feed.title,feed.url,feed.enabled,feed.last_checked_at,rule]).map_err(|e| e.to_string())?;
         Ok(())
     }
     pub fn list_feeds(&self) -> Result<Vec<RssFeed>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
-        let mut query = connection.prepare("SELECT id,title,url,enabled,last_checked_at,auto_download FROM rss_feeds ORDER BY title").map_err(|e| e.to_string())?;
+        let mut query = connection.prepare("SELECT id,title,url,enabled,last_checked_at,rule_json FROM rss_feeds ORDER BY title").map_err(|e| e.to_string())?;
         query
             .query_map([], |row| {
+                let rule: Option<String> = row.get(5)?;
                 Ok(RssFeed {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     url: row.get(2)?,
                     enabled: row.get(3)?,
                     last_checked_at: row.get(4)?,
-                    auto_download: row.get(5)?,
+                    rule: rule
+                        .and_then(|text| serde_json::from_str(&text).ok())
+                        .unwrap_or_default(),
                 })
             })
             .map_err(|e| e.to_string())?
@@ -159,6 +175,18 @@ impl Database {
             .execute(
                 "UPDATE rss_feeds SET enabled=?2 WHERE id=?1",
                 params![id, enabled],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn update_feed_rule(&self, id: &str, rule: &crate::models::FeedRule) -> Result<(), String> {
+        let rule = serde_json::to_string(rule).map_err(|e| e.to_string())?;
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "UPDATE rss_feeds SET rule_json=?2 WHERE id=?1",
+                params![id, rule],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -221,6 +249,7 @@ impl Database {
                 published_at: row.get(5)?,
                 downloaded: download.is_some(),
                 download,
+                matches_rule: false,
             })
         };
         if let Some(id) = feed_id {

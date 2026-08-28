@@ -75,3 +75,8 @@
 :root[data-theme="light"] .sync-status span{color:#267454}
 :root[data-theme="light"] .sync-status.pending{border-color:#ecd9c4;background:#fbf3e8}
 :root[data-theme="light"] .sync-status.pending span{color:#a06326}
+:root[data-theme="light"] .rule-editor{border-color:#ddd6e7;background:#f6f3fa}
+:root[data-theme="light"] .rule-fields label{color:#6e6776}
+:root[data-theme="light"] .rule-fields input{border-color:#d7d0df;background:#fff;color:#302a38}
+:root[data-theme="light"] .rule-toggle{color:#56505f}
+:root[data-theme="light"] .rule-hit{background:#e3f2e4;color:#2f7a44}

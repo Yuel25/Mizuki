@@ -72,6 +72,7 @@ pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<(String, Vec<R
                     .or_else(|| nested_dates.get(index).cloned().flatten()),
                 downloaded: false,
                 download: None,
+                matches_rule: false,
             }
         })
         .collect();
