@@ -68,9 +68,8 @@ tauri-action 自动生成 `latest.json`（Updater 索引）与 `.sig` 签名文�
 ## 6. 用户升级路径
 
 - 全新安装：`Mizuki_<版本>_x64-setup.exe`。
-- 已安装用户：tauri-action 发布后，旧版本通过 `latest.json` 拿到新版签名升级包。
-  （当前 0.2.0 尚未内置“检查更新”界面，`tauri-plugin-updater` 已接入，
-  后续可在设置页调用 `@tauri-apps/plugin-updater` 的 `check()`。）
+- 已安装用户：设置页 →“应用更新”→“检查更新”，发现新版本后点击“下载并重启”
+  （走 `latest.json` 索引与 minisign 签名校验，签名不符会拒绝安装）。
 
 ## 7. 常见问题
 

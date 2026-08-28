@@ -1486,6 +1486,7 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             let download_path = app.path().download_dir()?.join("Mizuki");

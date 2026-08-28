@@ -174,6 +174,9 @@ src-tauri\target\release\bundle\nsis\Mizuki_0.2.0_x64-setup.exe
 | 关闭窗口最小化到托盘 | 即时 |
 | 收藏数据展示 | 依据是否连接 Token |
 
+设置页另有“应用更新”区块（0.2.0）：显示当前版本，`check()` 查询 updater 端点，
+发现新版本可下载安装并自动重启（`tauri-plugin-updater` + `tauri-plugin-process`）。
+
 ### 4.11 当前界面
 
 侧边栏页面：今日（周表 + 置顶“我的追番”）、搜索、追番（五状态筛选）、RSS（订阅 + 规则 + 资源）、下载、设置。
@@ -233,8 +236,9 @@ Bangumi 原始详情与短评按 API 原字段直传（`total_episodes, rating.s
    - 建议后端加详情缓存（TTL + 并发限制）或改用批量季度数据源。
 2. 短评使用 Bangumi 私有 `/p1/` 接口
    - 当前可用但兼容性弱于 `/v0/`；失败时应提供跳转 Bangumi 网页的降级。
-3. Updater 已接入但无“检查更新”界面
-   - `tauri-plugin-updater` 已注册并在 Release CI 中签名；设置页需补 `check()` 调用与提示 UI。
+3. Updater 端点指向占位仓库
+   - “应用更新”已上线（设置页检查/下载/重启），但 `plugins.updater.endpoints`
+     中的 `OWNER` 需换成实际 GitHub 用户/组织，且需要先有一次带签名的 Release。
 4. 观看进度写回粒度
    - `ep` 是集数计数而非具体 episode id；对使用绝对编号的条目可能与 Bangumi 章节不完全一致。
 5. 文件级下载选择未实现
@@ -248,7 +252,7 @@ Bangumi 原始详情与短评按 API 原字段直传（`total_episodes, rating.s
 
 ## 8. 建议后续开发顺序
 
-1. 设置页接入“检查更新”（`@tauri-apps/plugin-updater`），配合 Release CI 验证一次真实升级。
+1. 配置 GitHub 远端与 Secrets 后推一次 v0.2.1 标签，端到端验证“检查更新”真实升级。
 2. 后端条目详情缓存（TTL），消除周表卡片 N+1 请求。
 3. 短评接口失败时降级跳转 Bangumi 网页。
 4. 为同步队列补一个真实 Bangumi 写回的集成测试（可用 staging token）。
@@ -301,4 +305,4 @@ cd ..; npm run tauri build          # Windows 安装包
 - [ ] 添加一个 Mikan RSS，配置规则（含字幕组/分辨率）并开启自动下载，确认新资源自动入队。
 - [ ] 设置限速与同时下载数，添加多个任务确认排队与续跑。
 - [ ] 下载完成后点击“目录”打开实际下载目录；多视频任务确认弹出选集对话框。
-- [ ] （有 GitHub 远端后）推 v0.2.1 标签验证 Release CI 产出签名升级包。
+- [ ] 设置页“应用更新”点击“检查更新”，确认提示“已是最新版本”（无远端 Release 时可能报网络错误，属预期）。

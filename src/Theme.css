@@ -85,3 +85,6 @@
 :root[data-theme="light"] .play-files button small{color:#898291}
 :root[data-theme="light"] .skeleton{background:#e9e5f0}
 :root[data-theme="light"] .skeleton::after{background:linear-gradient(90deg,transparent,#ffffffcc,transparent)}
+:root[data-theme="light"] .update-available{border-color:#cfe6d8;background:#eef8f1}
+:root[data-theme="light"] .update-available b{color:#267454}
+:root[data-theme="light"] .update-available p{color:#6e6776}
