@@ -66,7 +66,7 @@ Mizuki/
 │  ├─ src/models.rs         Rust 数据模型（Subject、RssFeed+FeedRule、DownloadTask 等）
 │  ├─ icons/                Tauri 打包图标
 │  └─ tauri.conf.json       窗口、CSP、updater 与 NSIS 打包配置
-├─ oauth-broker/            早期 OAuth 代理实验，当前桌面流程未使用（待归档或删除）
+├─ scripts/                 图标资源生成脚本（assets/icon → src-tauri/icons）
 ├─ RELEASE.md               发布流程（版本号、签名、CI、Authenticode）
 ├─ README.md                项目使用和构建说明
 └─ HANDOFF.md               本交接文档
@@ -249,6 +249,12 @@ Bangumi 原始详情与短评按 API 原字段直传（`total_episodes, rating.s
 - 删除任务时清理测速样本（轻微内存泄漏）。
 - 前端刷新回调 useCallback 固定，避免定时器被频繁重渲染重置。
 
+清理（2026-08-28）：
+
+- 删除废弃的 `oauth-broker/`（早期 OAuth 实验，零代码引用）。
+- 删除模板残留 `public/vite.svg`、`public/tauri.svg`、`src/assets/react.svg`
+  与无用的 `.env.example`（项目不读取任何环境变量）。
+
 ## 7. 已知问题与未完成项
 
 1. 集数仍按卡片逐个补查
@@ -265,11 +271,10 @@ Bangumi 原始详情与短评按 API 原字段直传（`total_episodes, rating.s
    - librqbit 9 的 `update_only_files` 为 crate 私有，只能在添加任务时通过 `only_files` 指定；
      当前未暴露“添加前预览种子文件并勾选”的流程。
 6. `tauri-plugin-deep-link` 已配置 `mizuki://`，业务未使用。
-7. `oauth-broker/` 已废弃但仍保留，应决定归档或删除。
-8. 播放路径的兼容边界
+7. 播放路径的兼容边界
    - 现已三层回退（见已修复记录），旧任务首次播放需联网恢复元数据并校验文件，稍慢属预期。
    - 种子来源（`source` 列）失效或离线时旧任务仍无法恢复，会提示“读取种子信息失败”。
-9. 无端到端/UI 测试；Rust 侧仍有部分压缩单行风格代码（`App.tsx`、`db.rs` 个别语句）。
+8. 无端到端/UI 测试；Rust 侧仍有部分压缩单行风格代码（`App.tsx`、`db.rs` 个别语句）。
 
 ## 8. 建议后续开发顺序
 
@@ -277,7 +282,7 @@ Bangumi 原始详情与短评按 API 原字段直传（`total_episodes, rating.s
 2. 后端条目详情缓存（TTL），消除周表卡片 N+1 请求。
 3. 短评接口失败时降级跳转 Bangumi 网页。
 4. 为同步队列补一个真实 Bangumi 写回的集成测试（可用 staging token）。
-5. 归档/删除 `oauth-broker/`，移除未用的 deep-link 配置。
+5. 移除未使用的 deep-link 配置。
 6. 压缩单行代码格式化拆分（`cargo fmt` + prettier）。
 7. 补端到端测试（如 WebDriver/tauri-driver）覆盖收藏与下载主流程。
 
