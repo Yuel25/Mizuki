@@ -71,3 +71,7 @@
 :root[data-theme="light"] *{scrollbar-color:#9674d2 #ece8f0}
 :root[data-theme="light"] *::-webkit-scrollbar-track{background:#ece8f0}
 :root[data-theme="light"] *::-webkit-scrollbar-thumb{border-color:#ece8f0;background:#9674d2}
+:root[data-theme="light"] .sync-status{border-color:#cfe6d8;background:#eef8f1}
+:root[data-theme="light"] .sync-status span{color:#267454}
+:root[data-theme="light"] .sync-status.pending{border-color:#ecd9c4;background:#fbf3e8}
+:root[data-theme="light"] .sync-status.pending span{color:#a06326}

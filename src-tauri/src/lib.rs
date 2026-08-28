@@ -35,6 +35,7 @@ struct AppState {
     download_path: PathBuf,
     trackers: tokio::sync::RwLock<Option<Vec<String>>>,
     download_gate: tokio::sync::Mutex<()>,
+    sync_notify: tokio::sync::Notify,
 }
 
 fn torrent_session_options() -> SessionOptions {
@@ -981,13 +982,7 @@ fn set_collection(
         let payload = serde_json::to_value(subject).map_err(|e| e.to_string())?;
         state.db.cache_subject(subject_id, &payload)?;
     }
-    // 写回失败进入同步队列重试（见 enqueue_collection_sync）。
-    if let Some(token) = stored_access_token() {
-        let client = state.client.clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = bangumi::set_collection(&client, &token, subject_id, &collection, None).await;
-        });
-    }
+    queue_collection_sync(&state, subject_id, &collection, None);
     Ok(())
 }
 
@@ -1009,15 +1004,90 @@ fn set_watch_progress(
     state
         .db
         .set_collection_progress(subject_id, &collection, watched)?;
-    if let Some(token) = stored_access_token() {
-        let client = state.client.clone();
-        let collection = collection.clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = bangumi::set_collection(&client, &token, subject_id, &collection, Some(watched))
-                .await;
-        });
-    }
+    queue_collection_sync(&state, subject_id, &collection, Some(watched));
     Ok(WatchProgress { collection, watched })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncStatus {
+    pending: i64,
+    last_error: Option<String>,
+    last_attempt_at: Option<String>,
+}
+
+/// 收藏改动入队待写回 Bangumi。未连接 Token 时跳过（本地模式无同步）。
+fn queue_collection_sync(state: &AppState, subject_id: i64, collection: &str, ep: Option<i64>) {
+    if stored_access_token().is_none() {
+        return;
+    }
+    if let Err(error) = state
+        .db
+        .enqueue_collection_sync(subject_id, collection, ep)
+    {
+        eprintln!("收藏改动入队失败：{error}");
+        return;
+    }
+    state.sync_notify.notify_one();
+}
+
+/// 失败退避：1→2 分钟起步，翻倍到 60 分钟封顶。
+fn sync_backoff_minutes(attempts: i64) -> i64 {
+    1i64.max(60.min(1 << attempts.clamp(1, 6)))
+}
+
+/// 处理所有到期的待同步条目，返回剩余数量。Token 缺失时不动队列。
+async fn process_sync_queue(state: &AppState) -> Result<i64, String> {
+    let Some(token) = stored_access_token() else {
+        return state.db.pending_sync_count();
+    };
+    for entry in state.db.due_sync_entries(50)? {
+        match bangumi::set_collection(
+            &state.client,
+            &token,
+            entry.subject_id,
+            &entry.collection,
+            entry.ep,
+        )
+        .await
+        {
+            Ok(()) => state.db.remove_sync_entry(entry.id)?,
+            Err(error) => {
+                let attempts = entry.attempts + 1;
+                let next = (chrono::Utc::now()
+                    + chrono::Duration::minutes(sync_backoff_minutes(attempts)))
+                .to_rfc3339();
+                state
+                    .db
+                    .mark_sync_attempt(entry.id, attempts, &next, &error)?;
+            }
+        }
+    }
+    state.db.pending_sync_count()
+}
+
+#[tauri::command]
+fn get_sync_status(state: tauri::State<'_, AppState>) -> Result<SyncStatus, String> {
+    let (pending, last_error, last_attempt_at) = state.db.sync_queue_summary()?;
+    Ok(SyncStatus {
+        pending,
+        last_error,
+        last_attempt_at,
+    })
+}
+
+/// 立即重试全部待同步条目，返回最新队列状态。
+#[tauri::command]
+async fn retry_sync_now(state: tauri::State<'_, AppState>) -> Result<SyncStatus, String> {
+    state.db.expire_all_sync_entries()?;
+    state.sync_notify.notify_one();
+    process_sync_queue(&state).await?;
+    let (pending, last_error, last_attempt_at) = state.db.sync_queue_summary()?;
+    Ok(SyncStatus {
+        pending,
+        last_error,
+        last_attempt_at,
+    })
 }
 
 #[tauri::command]
@@ -1074,6 +1144,20 @@ pub fn run() {
                 download_path,
                 trackers: tokio::sync::RwLock::new(None),
                 download_gate: tokio::sync::Mutex::new(()),
+                sync_notify: tokio::sync::Notify::new(),
+            });
+
+            // 同步队列 worker：处理到期的 Bangumi 写回，空闲时等通知或 45 秒轮询。
+            let sync_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = sync_app.state::<AppState>();
+                loop {
+                    let _ = process_sync_queue(&state).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(45)) => {}
+                        _ = state.sync_notify.notified() => {}
+                    }
+                }
             });
             let restore_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -1201,6 +1285,8 @@ pub fn run() {
             delete_download,
             set_collection,
             set_watch_progress,
+            get_sync_status,
+            retry_sync_now,
             get_comments,
             preview_rule_match
         ])

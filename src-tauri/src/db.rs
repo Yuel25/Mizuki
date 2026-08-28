@@ -41,7 +41,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS downloads(id TEXT PRIMARY KEY,title TEXT NOT NULL,episode TEXT NOT NULL,source TEXT NOT NULL,source_key TEXT,progress REAL NOT NULL DEFAULT 0,down_speed INTEGER NOT NULL DEFAULT 0,up_speed INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL,output_path TEXT NOT NULL,created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS local_collections(subject_id INTEGER PRIMARY KEY,collection TEXT NOT NULL,watched INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS cached_subjects(subject_id INTEGER PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);")
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sync_queue(id INTEGER PRIMARY KEY AUTOINCREMENT,subject_id INTEGER NOT NULL UNIQUE,collection TEXT NOT NULL,ep INTEGER,attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at TEXT NOT NULL,last_error TEXT,updated_at TEXT NOT NULL);")
             .map_err(|e| e.to_string())?;
         let has_rss_download: i64 = connection
             .query_row(
@@ -459,6 +460,115 @@ impl Database {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// 同一条目的待同步改动只保留最新一份（UNIQUE subject_id），避免乱序写回。
+    pub fn enqueue_collection_sync(
+        &self,
+        subject_id: i64,
+        collection: &str,
+        ep: Option<i64>,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO sync_queue(subject_id,collection,ep,attempts,next_attempt_at,updated_at) VALUES(?1,?2,?3,0,?4,?4) ON CONFLICT(subject_id) DO UPDATE SET collection=excluded.collection,ep=excluded.ep,attempts=0,next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at",params![subject_id,collection,ep,now]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn due_sync_entries(&self, limit: i64) -> Result<Vec<SyncEntry>, String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        let mut query = connection
+            .prepare(
+                "SELECT id,subject_id,collection,ep,attempts FROM sync_queue
+                 WHERE next_attempt_at<=?1 ORDER BY updated_at LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        query
+            .query_map(params![now, limit], |row| {
+                Ok(SyncEntry {
+                    id: row.get(0)?,
+                    subject_id: row.get(1)?,
+                    collection: row.get(2)?,
+                    ep: row.get(3)?,
+                    attempts: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn mark_sync_attempt(
+        &self,
+        id: i64,
+        attempts: i64,
+        next_attempt_at: &str,
+        last_error: &str,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "UPDATE sync_queue SET attempts=?2,next_attempt_at=?3,last_error=?4,updated_at=?5 WHERE id=?1",
+                params![id, attempts, next_attempt_at, last_error, chrono::Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn remove_sync_entry(&self, id: i64) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute("DELETE FROM sync_queue WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn expire_all_sync_entries(&self) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "UPDATE sync_queue SET next_attempt_at=?1",
+                [chrono::Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn pending_sync_count(&self) -> Result<i64, String> {
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        connection
+            .query_row("SELECT COUNT(*) FROM sync_queue", [], |row| row.get(0))
+            .map_err(|e| e.to_string())
+    }
+
+    /// (待同步数, 最近一次失败原因, 最近一次失败时间)
+    pub fn sync_queue_summary(&self) -> Result<(i64, Option<String>, Option<String>), String> {
+        let pending = self.pending_sync_count()?;
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        let last = connection
+            .query_row(
+                "SELECT last_error,updated_at FROM sync_queue WHERE last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .ok();
+        Ok((
+            pending,
+            last.as_ref().and_then(|(error, _)| error.clone()),
+            last.map(|(_, at)| at),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncEntry {
+    pub id: i64,
+    pub subject_id: i64,
+    pub collection: String,
+    pub ep: Option<i64>,
+    pub attempts: i64,
 }
 
 #[cfg(test)]
@@ -555,5 +665,35 @@ mod tests {
             db.get_setting("rss_interval_minutes").unwrap().as_deref(),
             Some("30")
         );
+    }
+
+    #[test]
+    fn sync_queue_keeps_latest_entry_per_subject_and_retries() {
+        let db = db();
+        db.enqueue_collection_sync(7, "doing", Some(3)).unwrap();
+        db.enqueue_collection_sync(7, "collect", Some(12)).unwrap();
+        db.enqueue_collection_sync(8, "wish", None).unwrap();
+        assert_eq!(db.pending_sync_count().unwrap(), 2, "同一条目只保留最新改动");
+        let due = db.due_sync_entries(10).unwrap();
+        let entry = due.iter().find(|e| e.subject_id == 7).unwrap();
+        assert_eq!(entry.collection, "collect");
+        assert_eq!(entry.ep, Some(12));
+        assert_eq!(entry.attempts, 0, "重新入队要重置退避计数");
+        // 失败进入退避：到期时间推到远期后不再被取出。
+        db.mark_sync_attempt(entry.id, 1, "2999-01-01T00:00:00+00:00", "Bangumi 同步失败：500")
+            .unwrap();
+        assert!(db
+            .due_sync_entries(10)
+            .unwrap()
+            .iter()
+            .all(|e| e.subject_id != 7));
+        let (pending, last_error, last_attempt_at) = db.sync_queue_summary().unwrap();
+        assert_eq!(pending, 2);
+        assert_eq!(last_error.as_deref(), Some("Bangumi 同步失败：500"));
+        assert!(last_attempt_at.is_some());
+        db.expire_all_sync_entries().unwrap();
+        assert_eq!(db.due_sync_entries(10).unwrap().len(), 2);
+        db.remove_sync_entry(entry.id).unwrap();
+        assert_eq!(db.pending_sync_count().unwrap(), 1);
     }
 }
