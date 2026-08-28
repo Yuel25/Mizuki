@@ -1,0 +1,41 @@
+name: Release
+
+# 推送 v* 标签时构建 Windows 安装包与升级包，创建 GitHub Release 草稿。
+# 依赖仓库 Secrets：
+#   TAURI_SIGNING_PRIVATE_KEY          .keys/mizuki.key 的内容（Updater 签名私钥）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD 私钥密码（当前密钥为空密码，留空即可）
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Mizuki ${{ github.ref_name }}"
+          releaseBody: "Windows x64 安装包与升级包。覆盖安装 setup.exe，或在旧版本内自动更新。"
+          releaseDraft: true
+          prerelease: false
+          args: "--target x86_64-pc-windows-msvc"

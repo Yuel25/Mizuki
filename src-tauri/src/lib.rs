@@ -1485,6 +1485,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             let download_path = app.path().download_dir()?.join("Mizuki");
