@@ -80,6 +80,18 @@ impl Database {
                 .execute("ALTER TABLE rss_feeds ADD COLUMN rule_json TEXT", [])
                 .map_err(|e| e.to_string())?;
         }
+        let has_playback_path: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('downloads') WHERE name='playback_path'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if has_playback_path == 0 {
+            connection
+                .execute("ALTER TABLE downloads ADD COLUMN playback_path TEXT", [])
+                .map_err(|e| e.to_string())?;
+        }
         // 旧版本保存的是完整磁力链接。统一迁移为 info-hash，避免升级后重复创建任务。
         let download_sources = {
             let mut query = connection
@@ -297,7 +309,7 @@ impl Database {
 
     pub fn list_downloads(&self) -> Result<Vec<DownloadTask>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
-        let mut query=connection.prepare("SELECT id,title,episode,progress,down_speed,up_speed,state,output_path FROM downloads ORDER BY created_at DESC").map_err(|e|e.to_string())?;
+        let mut query=connection.prepare("SELECT id,title,episode,progress,down_speed,up_speed,state,output_path,playback_path FROM downloads ORDER BY created_at DESC").map_err(|e|e.to_string())?;
         query
             .query_map([], |row| {
                 Ok(DownloadTask {
@@ -309,6 +321,7 @@ impl Database {
                     up_speed: row.get(5)?,
                     state: row.get(6)?,
                     output_path: row.get(7)?,
+                    playback_path: row.get(8)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -326,7 +339,7 @@ impl Database {
     }
     pub fn download_by_source_key(&self, source_key: &str) -> Result<Option<DownloadTask>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
-        let mut query=connection.prepare("SELECT id,title,episode,progress,down_speed,up_speed,state,output_path FROM downloads WHERE source_key=?1 AND state<>'failed' ORDER BY created_at DESC LIMIT 1").map_err(|e|e.to_string())?;
+        let mut query=connection.prepare("SELECT id,title,episode,progress,down_speed,up_speed,state,output_path,playback_path FROM downloads WHERE source_key=?1 AND state<>'failed' ORDER BY created_at DESC LIMIT 1").map_err(|e|e.to_string())?;
         match query.query_row([source_key], |row| {
             Ok(DownloadTask {
                 id: row.get(0)?,
@@ -337,6 +350,7 @@ impl Database {
                 up_speed: row.get(5)?,
                 state: row.get(6)?,
                 output_path: row.get(7)?,
+                playback_path: row.get(8)?,
             })
         }) {
             Ok(task) => Ok(Some(task)),
@@ -349,13 +363,14 @@ impl Database {
             .lock()
             .map_err(|e| e.to_string())?
             .execute(
-                "UPDATE downloads SET progress=?2,down_speed=?3,up_speed=?4,state=?5 WHERE id=?1",
+                "UPDATE downloads SET progress=?2,down_speed=?3,up_speed=?4,state=?5,playback_path=?6 WHERE id=?1",
                 params![
                     task.id,
                     task.progress,
                     task.down_speed,
                     task.up_speed,
-                    task.state
+                    task.state,
+                    task.playback_path
                 ],
             )
             .map_err(|e| e.to_string())?;

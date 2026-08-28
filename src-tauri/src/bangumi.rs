@@ -5,6 +5,18 @@ fn number(value: Option<&Value>) -> f64 {
     value.and_then(Value::as_f64).unwrap_or_default()
 }
 
+/// Bangumi 旧接口（calendar 等）会返回 http:// 图片地址；统一升级为 https，
+/// 否则会被应用 CSP 的 img-src 白名单拦截，表现为封面加载不出来。
+fn https_image(url: Option<String>) -> Option<String> {
+    url.map(|url| {
+        if url.starts_with("http://lain.bgm.tv/") || url.starts_with("http://bgm.tv/") {
+            format!("https://{}", &url["http://".len()..])
+        } else {
+            url
+        }
+    })
+}
+
 pub fn subject_from_v0(value: &Value, collection: Option<String>, watched: i64) -> Subject {
     Subject {
         id: value.get("id").and_then(Value::as_i64).unwrap_or_default(),
@@ -24,10 +36,12 @@ pub fn subject_from_v0(value: &Value, collection: Option<String>, watched: i64) 
             .and_then(Value::as_str)
             .unwrap_or_default()
             .into(),
-        image: value
-            .pointer("/images/large")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        image: https_image(
+            value
+                .pointer("/images/large")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ),
         score: number(value.pointer("/rating/score")).max(number(value.get("score"))),
         rank: value
             .pointer("/rating/rank")
@@ -327,5 +341,21 @@ mod tests {
         assert_eq!(collection_kind("wish"), Some(1));
         assert_eq!(collection_kind("doing"), Some(3));
         assert_eq!(collection_kind("unknown"), None);
+    }
+    #[test]
+    fn calendar_http_image_urls_are_upgraded_to_https() {
+        // CSP 只放行 https 图片；旧 calendar 接口返回 http 地址必须被规范化。
+        let value = serde_json::json!({"id":1,"name":"A","images":{"large":"http://lain.bgm.tv/pic/cover/l/ce/e2/456080_C4q4C.jpg"}});
+        let subject = subject_from_v0(&value, None, 0);
+        assert_eq!(
+            subject.image.as_deref(),
+            Some("https://lain.bgm.tv/pic/cover/l/ce/e2/456080_C4q4C.jpg")
+        );
+        let already_https = serde_json::json!({"id":2,"name":"B","images":{"large":"https://lain.bgm.tv/pic/cover/x.jpg"}});
+        assert_eq!(
+            subject_from_v0(&already_https, None, 0).image.as_deref(),
+            Some("https://lain.bgm.tv/pic/cover/x.jpg")
+        );
+        assert_eq!(subject_from_v0(&serde_json::json!({"id":3,"name":"C"}), None, 0).image, None);
     }
 }

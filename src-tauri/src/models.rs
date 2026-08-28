@@ -20,7 +20,7 @@ pub struct RssFeed { pub id:String, pub title:String, pub url:String, pub enable
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DownloadTask { pub id:String, pub title:String, pub episode:String, pub progress:f64, pub down_speed:u64, pub up_speed:u64, pub state:String, pub output_path:String }
+pub struct DownloadTask { pub id:String, pub title:String, pub episode:String, pub progress:f64, pub down_speed:u64, pub up_speed:u64, pub state:String, pub output_path:String, #[serde(default)] pub playback_path:Option<String> }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

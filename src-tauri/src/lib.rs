@@ -88,6 +88,18 @@ fn torrent_session_options(settings: &AppSettings) -> SessionOptions {
 
 const TRACKERLIST_URL: &str = "https://cf.trackerslist.com/best.txt";
 
+const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "webm", "avi", "mov", "m4v", "ts"];
+
+fn is_video_file(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            VIDEO_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
 static EXITING: AtomicBool = AtomicBool::new(false);
 
 #[derive(serde::Serialize)]
@@ -224,8 +236,19 @@ fn profile_from_value(value: &serde_json::Value) -> BangumiProfile {
 }
 
 fn subject_from_cache(value: &serde_json::Value) -> Subject {
-    serde_json::from_value::<Subject>(value.clone())
-        .unwrap_or_else(|_| bangumi::subject_from_v0(value, None, 0))
+    let mut subject = serde_json::from_value::<Subject>(value.clone())
+        .unwrap_or_else(|_| bangumi::subject_from_v0(value, None, 0));
+    // 缓存里存的旧 JSON 可能还是 http 图片地址，读取时统一升级。
+    let needs_upgrade = subject
+        .image
+        .as_deref()
+        .is_some_and(|image| image.starts_with("http://lain.bgm.tv/") || image.starts_with("http://bgm.tv/"));
+    if needs_upgrade {
+        subject.image = subject
+            .image
+            .map(|image| format!("https://{}", &image["http://".len()..]));
+    }
+    subject
 }
 
 /// 周表 + 本地收藏 + Bangumi 收藏缓存条目 => 今日/追番页的完整条目列表。
@@ -845,6 +868,7 @@ async fn start_download(
                 up_speed: 0,
                 state: "queued".into(),
                 output_path: String::new(),
+                playback_path: None,
             },
             true,
         ),
@@ -1105,6 +1129,10 @@ fn list_downloads(
                         let _ = session.pause(&handle).await;
                     });
                 }
+                // 完成时记住主视频路径：重启后任务句柄不再恢复，播放要靠这条记录。
+                if task.playback_path.is_none() {
+                    task.playback_path = largest_video_file(handle);
+                }
             }
             if task.state == "downloading"
                 && let Some(live) = stats.live
@@ -1201,60 +1229,96 @@ struct PlaybackFile {
     path: String,
 }
 
+/// 从任务元数据里挑体积最大的视频文件（播放默认策略）。
+fn largest_video_file(handle: &ManagedTorrent) -> Option<String> {
+    handle
+        .with_metadata(|metadata| {
+            metadata
+                .file_infos
+                .iter()
+                .filter(|file| is_video_file(&file.relative_filename))
+                .max_by_key(|file| file.len)
+                .map(|file| {
+                    handle
+                        .output_folder()
+                        .join(&file.relative_filename)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+        })
+        .ok()
+        .flatten()
+}
+
 #[tauri::command]
 fn download_playback_files(
     id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<PlaybackFile>, String> {
-    const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "webm", "avi", "mov", "m4v", "ts"];
     let handle = state
         .handles
         .lock()
         .map_err(|e| e.to_string())?
         .get(&id)
-        .cloned()
-        .ok_or("任务不存在或尚未恢复")?;
-    if !handle.stats().finished {
-        return Err("下载尚未完成".into());
+        .cloned();
+    if let Some(handle) = handle {
+        if !handle.stats().finished {
+            return Err("下载尚未完成".into());
+        }
+        let mut files = handle
+            .with_metadata(|metadata| {
+                metadata
+                    .file_infos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, file)| is_video_file(&file.relative_filename))
+                    .map(|(index, file)| {
+                        let path = handle.output_folder().join(&file.relative_filename);
+                        PlaybackFile {
+                            index,
+                            name: file
+                                .relative_filename
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| {
+                                    file.relative_filename.to_string_lossy().into_owned()
+                                }),
+                            size: file.len,
+                            path: path.to_string_lossy().into_owned(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())?;
+        if files.is_empty() {
+            return Err("该任务中没有可播放的视频文件".into());
+        }
+        // 多视频合集按文件名排序，选集时更像剧集列表。
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        return Ok(files);
     }
-    let mut files = handle
-        .with_metadata(|metadata| {
-            metadata
-                .file_infos
-                .iter()
-                .enumerate()
-                .filter(|(_, file)| {
-                    file.relative_filename
-                        .extension()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|extension| {
-                            VIDEO_EXTENSIONS
-                                .iter()
-                                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-                        })
-                })
-                .map(|(index, file)| {
-                    let path = handle.output_folder().join(&file.relative_filename);
-                    PlaybackFile {
-                        index,
-                        name: file
-                            .relative_filename
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| file.relative_filename.to_string_lossy().into_owned()),
-                        size: file.len,
-                        path: path.to_string_lossy().into_owned(),
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .map_err(|e| e.to_string())?;
-    if files.is_empty() {
-        return Err("该任务中没有可播放的视频文件".into());
+    // 任务句柄不存在（应用重启后完成任务不恢复到会话）：回退到完成时落库的主视频路径。
+    let stored = state
+        .db
+        .list_downloads()?
+        .into_iter()
+        .find(|task| task.id == id)
+        .and_then(|task| task.playback_path)
+        .ok_or("任务不存在或尚未恢复，且没有已记录的视频路径")?;
+    let path = PathBuf::from(&stored);
+    if !path.is_file() {
+        return Err("视频文件不存在，可能已被移动或删除".into());
     }
-    // 多视频合集按文件名排序，选集时更像剧集列表。
-    files.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(files)
+    let size = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+    Ok(vec![PlaybackFile {
+        index: 0,
+        name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| stored.clone()),
+        size,
+        path: stored,
+    }])
 }
 
 #[derive(serde::Serialize)]
