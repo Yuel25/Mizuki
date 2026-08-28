@@ -1,7 +1,7 @@
 # Mizuki 项目交接文档
 
 > 最后更新：2026-08-28  
-> 当前版本：0.2.0  
+> 当前版本：0.2.1  
 > 目标平台：Windows x64  
 > 项目目录：`D:\projects\Mizuki`（已是 Git 仓库，main 分支）
 
@@ -249,6 +249,15 @@ Bangumi 原始详情与短评按 API 原字段直传（`total_episodes, rating.s
 - 删除任务时清理测速样本（轻微内存泄漏）。
 - 前端刷新回调 useCallback 固定，避免定时器被频繁重渲染重置。
 
+发布（2026-08-28，v0.2.1）：
+
+- GitHub 仓库 Yuel25/Mizuki 已建立（public，MIT），Release CI 验证通过。
+- Secrets：TAURI_SIGNING_PRIVATE_KEY / PASSWORD 已配置；补上
+  bundle.createUpdaterArtifacts 后 CI 产出安装包 + .sig + latest.json。
+- Release 已正式发布：https://github.com/Yuel25/Mizuki/releases/tag/v0.2.1
+- 注意：0.2.0 安装包内的 updater 端点还是占位符，0.2.0 用户需手动安装 0.2.1；
+  从 0.2.1 起“检查更新”走真实端点，后续版本可自动升级。
+
 清理（2026-08-28）：
 
 - 删除废弃的 `oauth-broker/`（早期 OAuth 实验，零代码引用）。
@@ -278,8 +287,7 @@ Bangumi 原始详情与短评按 API 原字段直传（`total_episodes, rating.s
 
 ## 8. 建议后续开发顺序
 
-1. 配置 GitHub 远端与 Secrets 后推一次 v0.2.1 标签，端到端验证“检查更新”真实升级。
-2. 后端条目详情缓存（TTL），消除周表卡片 N+1 请求。
+1. 后端条目详情缓存（TTL），消除周表卡片 N+1 请求。
 3. 短评接口失败时降级跳转 Bangumi 网页。
 4. 为同步队列补一个真实 Bangumi 写回的集成测试（可用 staging token）。
 5. 移除未使用的 deep-link 配置。
