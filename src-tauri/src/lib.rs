@@ -36,9 +36,30 @@ struct AppState {
     trackers: tokio::sync::RwLock<Option<Vec<String>>>,
     download_gate: tokio::sync::Mutex<()>,
     sync_notify: tokio::sync::Notify,
+    settings: Mutex<AppSettings>,
 }
 
-fn torrent_session_options() -> SessionOptions {
+impl AppState {
+    fn settings(&self) -> AppSettings {
+        self.settings
+            .lock()
+            .map(|settings| settings.clone())
+            .unwrap_or_default()
+    }
+
+    /// 新任务的输出目录：自定义目录或默认“下载\Mizuki”。
+    fn download_dir(&self) -> PathBuf {
+        self.settings()
+            .download_dir
+            .and_then(|dir| {
+                let path = PathBuf::from(&dir);
+                path.is_absolute().then_some(path)
+            })
+            .unwrap_or_else(|| self.download_path.clone())
+    }
+}
+
+fn torrent_session_options(settings: &AppSettings) -> SessionOptions {
     SessionOptions {
         // Session::new() leaves the peer listener disabled in librqbit 9. That makes
         // every connection outbound-only and can substantially reduce the available
@@ -46,11 +67,20 @@ fn torrent_session_options() -> SessionOptions {
         listen: Some(ListenerOptions {
             mode: ListenerMode::TcpAndUtp,
             enable_upnp_port_forwarding: true,
+            listen_addr: std::net::SocketAddr::new(
+                std::net::Ipv6Addr::UNSPECIFIED.into(),
+                settings.bt_listen_port,
+            ),
+            announce_port: (settings.bt_listen_port > 0).then_some(settings.bt_listen_port),
             ..Default::default()
         }),
         // Keep enough candidates around for swarms where only a small fraction of
         // discovered peers are fast or reachable.
-        peer_limit: Some(256),
+        peer_limit: Some(settings.bt_peer_limit as usize),
+        ratelimits: librqbit::limits::LimitsConfig {
+            upload_bps: kbps_to_bps(settings.bt_upload_kbps),
+            download_bps: kbps_to_bps(settings.bt_download_kbps),
+        },
         client_name_and_version: Some(format!("Mizuki/{}", env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     }
@@ -83,6 +113,84 @@ struct SearchPayload {
     subjects: Vec<Subject>,
     local_only: bool,
     warning: Option<String>,
+}
+
+/// 全部设置项。以 JSON 存在 settings 表（key=app_settings），
+/// serde(default) 保证旧数据缺字段时逐项回落默认值。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AppSettings {
+    /// BT 监听端口，0 表示随机。重启应用后生效。
+    bt_listen_port: u16,
+    /// 上传/下载限速，KB/s；0 表示不限。
+    bt_upload_kbps: u64,
+    bt_download_kbps: u64,
+    /// 每个 torrent 的最大连接 peer 数。重启后生效。
+    bt_peer_limit: u32,
+    /// 同时下载的任务数上限，0 表示不限；超出部分排队（paused + queued）。
+    max_concurrent_downloads: u32,
+    /// 下载完成后自动暂停任务（停止做种）。
+    stop_seeding_on_complete: bool,
+    rss_interval_minutes: u32,
+    /// 自定义下载目录；None 表示系统下载目录下的 Mizuki。
+    download_dir: Option<String>,
+    autostart: bool,
+    close_to_tray: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            bt_listen_port: 0,
+            bt_upload_kbps: 0,
+            bt_download_kbps: 0,
+            bt_peer_limit: 256,
+            max_concurrent_downloads: 0,
+            stop_seeding_on_complete: true,
+            rss_interval_minutes: 15,
+            download_dir: None,
+            autostart: false,
+            close_to_tray: true,
+        }
+    }
+}
+
+const SETTINGS_KEY: &str = "app_settings";
+
+fn load_settings(db: &Database) -> AppSettings {
+    db.get_setting(SETTINGS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+fn store_settings(db: &Database, settings: &AppSettings) -> Result<(), String> {
+    let json = serde_json::to_string(settings).map_err(|e| e.to_string())?;
+    db.set_setting(SETTINGS_KEY, &json)
+}
+
+fn kbps_to_bps(kbps: u64) -> Option<std::num::NonZeroU32> {
+    if kbps == 0 || kbps > u32::MAX as u64 / 1024 {
+        return None;
+    }
+    std::num::NonZeroU32::new((kbps * 1024) as u32)
+}
+
+fn validate_settings(settings: &AppSettings) -> Result<(), String> {
+    if settings.bt_upload_kbps > 1_000_000 || settings.bt_download_kbps > 1_000_000 {
+        return Err("限速上限为 1000000 KB/s".into());
+    }
+    if !(1..=2000).contains(&settings.bt_peer_limit) {
+        return Err("每任务连接数需在 1-2000 之间".into());
+    }
+    if settings.max_concurrent_downloads > 20 {
+        return Err("并发任务数最多 20".into());
+    }
+    if !(5..=1440).contains(&settings.rss_interval_minutes) {
+        return Err("RSS 刷新间隔需在 5-1440 分钟之间".into());
+    }
+    Ok(())
 }
 
 fn token_entry() -> Result<keyring::Entry, String> {
@@ -548,16 +656,52 @@ mod calendar_merge_tests {
 
 #[cfg(test)]
 mod download_tests {
-    use super::{download_source_key, magnet_with_trackers, torrent_session_options};
+    use super::{AppSettings, download_source_key, magnet_with_trackers, torrent_session_options, validate_settings};
     use librqbit::ListenerMode;
 
     #[test]
     fn desktop_session_accepts_incoming_tcp_and_utp_peers() {
-        let options = torrent_session_options();
+        let options = torrent_session_options(&AppSettings::default());
         let listener = options.listen.expect("peer listener should be enabled");
         assert!(matches!(listener.mode, ListenerMode::TcpAndUtp));
         assert!(listener.enable_upnp_port_forwarding);
         assert_eq!(options.peer_limit, Some(256));
+        assert_eq!(listener.listen_addr.port(), 0, "默认使用随机端口");
+    }
+
+    #[test]
+    fn session_options_apply_bt_settings() {
+        let settings = AppSettings {
+            bt_listen_port: 4242,
+            bt_upload_kbps: 512,
+            bt_download_kbps: 0,
+            bt_peer_limit: 120,
+            ..Default::default()
+        };
+        let options = torrent_session_options(&settings);
+        let listener = options.listen.expect("peer listener should be enabled");
+        assert_eq!(listener.listen_addr.port(), 4242);
+        assert_eq!(listener.announce_port, Some(4242));
+        assert_eq!(options.peer_limit, Some(120));
+        assert_eq!(
+            options.ratelimits.upload_bps.map(|v| v.get()),
+            Some(512 * 1024)
+        );
+        assert_eq!(options.ratelimits.download_bps, None, "0 表示不限速");
+    }
+
+    #[test]
+    fn settings_validation_bounds() {
+        let mut settings = AppSettings::default();
+        assert!(validate_settings(&settings).is_ok());
+        settings.bt_peer_limit = 0;
+        assert!(validate_settings(&settings).is_err());
+        settings.bt_peer_limit = 256;
+        settings.bt_download_kbps = 2_000_000;
+        assert!(validate_settings(&settings).is_err());
+        settings.bt_download_kbps = 0;
+        settings.rss_interval_minutes = 1;
+        assert!(validate_settings(&settings).is_err());
     }
 
     #[test]
@@ -595,6 +739,69 @@ mod download_tests {
                 "https://new.example/announce".to_owned()
             ]
         );
+    }
+}
+
+/// 正在占用下载槽位的任务数（排队中的也算，防止超卖）。
+fn active_download_count(state: &AppState) -> usize {
+    let Ok(tasks) = state.db.list_downloads() else {
+        return 0;
+    };
+    let handles = state
+        .handles
+        .lock()
+        .map(|handles| handles.keys().cloned().collect::<std::collections::HashSet<_>>())
+        .unwrap_or_default();
+    tasks
+        .iter()
+        .filter(|task| {
+            handles.contains(&task.id) && (task.state == "downloading" || task.state == "queued")
+        })
+        .count()
+}
+
+/// 有空闲槽位时把排队的任务（paused 句柄 + queued 状态）继续启动。
+fn promote_queued_downloads(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let settings = state.settings();
+    if settings.max_concurrent_downloads == 0 {
+        return;
+    }
+    let Ok(tasks) = state.db.list_downloads() else {
+        return;
+    };
+    let handles = state
+        .handles
+        .lock()
+        .map(|handles| handles.clone())
+        .unwrap_or_default();
+    let active = tasks
+        .iter()
+        .filter(|task| handles.contains_key(&task.id) && task.state == "downloading")
+        .count() as i64;
+    let mut slots = settings.max_concurrent_downloads as i64 - active;
+    for task in tasks.iter().filter(|task| task.state == "queued") {
+        if slots <= 0 {
+            break;
+        }
+        let Some(handle) = handles.get(&task.id) else {
+            continue;
+        };
+        // 先占位再启动，避免轮询重入导致超额。
+        if state.db.set_download_state(&task.id, "downloading").is_err() {
+            continue;
+        }
+        slots -= 1;
+        let app = app.clone();
+        let handle = handle.clone();
+        let id = task.id.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
+            if state.bt.unpause(&handle).await.is_err() {
+                // 启动失败退回排队，等下一次轮询重试。
+                let _ = state.db.set_download_state(&id, "queued");
+            }
+        });
     }
 }
 
@@ -637,12 +844,26 @@ async fn start_download(
                 down_speed: 0,
                 up_speed: 0,
                 state: "queued".into(),
-                output_path: state.download_path.to_string_lossy().into_owned(),
+                output_path: String::new(),
             },
             true,
         ),
     };
+    // 已有任务沿用原目录，避免改设置后旧任务找不到数据。
+    let output_dir = if is_new {
+        state.download_dir()
+    } else {
+        PathBuf::from(&task.output_path)
+    };
+    task.output_path = output_dir.to_string_lossy().into_owned();
     let restore_paused = task.state == "paused";
+    let over_limit = {
+        let settings = state.settings();
+        settings.max_concurrent_downloads > 0
+            && active_download_count(state) >= settings.max_concurrent_downloads as usize
+    };
+    // 排队任务以 paused 句柄加入会话，等有空位再 unpause。
+    let add_paused = restore_paused || over_limit;
     if is_new {
         state
             .db
@@ -653,6 +874,8 @@ async fn start_download(
     let options = AddTorrentOptions {
         // Existing partial/complete files are opened without truncation and hash-checked for resume.
         overwrite: true,
+        paused: add_paused,
+        output_folder: Some(output_dir.to_string_lossy().into_owned()),
         trackers: (!source.starts_with("magnet:") && !trackers.is_empty()).then_some(trackers),
         ..Default::default()
     };
@@ -662,22 +885,12 @@ async fn start_download(
                 state.db.set_download_state(&task.id, "failed")?;
                 return Err("下载引擎未能创建任务，请重试".into());
             };
-            if restore_paused {
-                if let Err(error) = state.bt.pause(&handle).await {
-                    state.db.set_download_state(&task.id, "failed")?;
-                    return Err(error.to_string());
-                }
-            }
             state
                 .handles
                 .lock()
                 .map_err(|e| e.to_string())?
                 .insert(task.id.clone(), handle);
-            task.state = if restore_paused {
-                "paused".into()
-            } else {
-                "downloading".into()
-            };
+            task.state = if add_paused { "queued" } else { "downloading" }.into();
             state.db.set_download_state(&task.id, &task.state)?;
             Ok(task)
         }
@@ -844,10 +1057,14 @@ async fn download_rss_items(
 }
 
 #[tauri::command]
-fn list_downloads(state: tauri::State<'_, AppState>) -> Result<Vec<DownloadTask>, String> {
+fn list_downloads(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<DownloadTask>, String> {
     let mut tasks = state.db.list_downloads()?;
     let handles = state.handles.lock().map_err(|e| e.to_string())?;
     let mut speed_samples = state.speed_samples.lock().map_err(|e| e.to_string())?;
+    let mut completed_now = false;
     for task in &mut tasks {
         if let Some(handle) = handles.get(&task.id) {
             let stats = handle.stats();
@@ -879,11 +1096,15 @@ fn list_downloads(state: tauri::State<'_, AppState>) -> Result<Vec<DownloadTask>
             }
             .into();
             if stats.finished && !was_completed {
-                let session = state.bt.clone();
-                let handle = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = session.pause(&handle).await;
-                });
+                completed_now = true;
+                // 完成后可选自动暂停（停止做种），由设置控制。
+                if state.settings().stop_seeding_on_complete {
+                    let session = state.bt.clone();
+                    let handle = handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = session.pause(&handle).await;
+                    });
+                }
             }
             if task.state == "downloading"
                 && let Some(live) = stats.live
@@ -899,6 +1120,11 @@ fn list_downloads(state: tauri::State<'_, AppState>) -> Result<Vec<DownloadTask>
         }
         state.db.update_download(task)?;
     }
+    drop(speed_samples);
+    drop(handles);
+    if completed_now {
+        promote_queued_downloads(&app);
+    }
     Ok(tasks)
 }
 
@@ -913,7 +1139,11 @@ async fn add_download(
 }
 
 #[tauri::command]
-async fn pause_download(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn pause_download(
+    app: tauri::AppHandle,
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let handle = state
         .handles
         .lock()
@@ -922,7 +1152,10 @@ async fn pause_download(id: String, state: tauri::State<'_, AppState>) -> Result
         .cloned()
         .ok_or("任务不存在")?;
     state.bt.pause(&handle).await.map_err(|e| e.to_string())?;
-    state.db.set_download_state(&id, "paused")
+    state.db.set_download_state(&id, "paused")?;
+    // 手动暂停也会腾出下载槽位。
+    promote_queued_downloads(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -939,50 +1172,8 @@ async fn resume_download(id: String, state: tauri::State<'_, AppState>) -> Resul
 }
 
 #[tauri::command]
-fn download_playback_path(
-    id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "webm", "avi", "mov", "m4v", "ts"];
-    let handle = state
-        .handles
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get(&id)
-        .cloned()
-        .ok_or("任务不存在或尚未恢复")?;
-    if !handle.stats().finished {
-        return Err("下载尚未完成".into());
-    }
-    let relative_path = handle
-        .with_metadata(|metadata| {
-            metadata
-                .file_infos
-                .iter()
-                .filter(|file| {
-                    file.relative_filename
-                        .extension()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|extension| {
-                            VIDEO_EXTENSIONS
-                                .iter()
-                                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-                        })
-                })
-                .max_by_key(|file| file.len)
-                .map(|file| file.relative_filename.clone())
-        })
-        .map_err(|e| e.to_string())?
-        .ok_or("该任务中没有可播放的视频文件")?;
-    let path = handle.output_folder().join(relative_path);
-    if !path.is_file() {
-        return Err("视频文件不存在，可能已被移动或删除".into());
-    }
-    Ok(path.to_string_lossy().into_owned())
-}
-
-#[tauri::command]
 async fn delete_download(
+    app: tauri::AppHandle,
     id: String,
     delete_files: bool,
     state: tauri::State<'_, AppState>,
@@ -996,7 +1187,74 @@ async fn delete_download(
             .map_err(|e| e.to_string())?
     }
     state.db.reset_rss_download_for_task(&id)?;
-    state.db.delete_download(&id)
+    state.db.delete_download(&id)?;
+    promote_queued_downloads(&app);
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaybackFile {
+    index: usize,
+    name: String,
+    size: u64,
+    path: String,
+}
+
+#[tauri::command]
+fn download_playback_files(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<PlaybackFile>, String> {
+    const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "webm", "avi", "mov", "m4v", "ts"];
+    let handle = state
+        .handles
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&id)
+        .cloned()
+        .ok_or("任务不存在或尚未恢复")?;
+    if !handle.stats().finished {
+        return Err("下载尚未完成".into());
+    }
+    let mut files = handle
+        .with_metadata(|metadata| {
+            metadata
+                .file_infos
+                .iter()
+                .enumerate()
+                .filter(|(_, file)| {
+                    file.relative_filename
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|extension| {
+                            VIDEO_EXTENSIONS
+                                .iter()
+                                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+                        })
+                })
+                .map(|(index, file)| {
+                    let path = handle.output_folder().join(&file.relative_filename);
+                    PlaybackFile {
+                        index,
+                        name: file
+                            .relative_filename
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| file.relative_filename.to_string_lossy().into_owned()),
+                        size: file.len,
+                        path: path.to_string_lossy().into_owned(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .map_err(|e| e.to_string())?;
+    if files.is_empty() {
+        return Err("该任务中没有可播放的视频文件".into());
+    }
+    // 多视频合集按文件名排序，选集时更像剧集列表。
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
 }
 
 #[derive(serde::Serialize)]
@@ -1130,6 +1388,67 @@ async fn retry_sync_now(state: tauri::State<'_, AppState>) -> Result<SyncStatus,
 }
 
 #[tauri::command]
+fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
+    Ok(state.settings())
+}
+
+/// 保存设置并让可即时生效的部分（限速、开机启动、下载目录）立即应用。
+/// 端口与连接数在会话创建时读取，重启后生效。
+#[tauri::command]
+fn save_settings(
+    settings: AppSettings,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppSettings, String> {
+    validate_settings(&settings)?;
+    if let Some(dir) = &settings.download_dir {
+        let path = PathBuf::from(dir);
+        if !path.is_absolute() {
+            return Err("下载目录必须是绝对路径".into());
+        }
+        std::fs::create_dir_all(&path).map_err(|e| format!("无法创建下载目录：{e}"))?;
+    }
+    store_settings(&state.db, &settings)?;
+    state
+        .bt
+        .ratelimits
+        .set_upload_bps(kbps_to_bps(settings.bt_upload_kbps));
+    state
+        .bt
+        .ratelimits
+        .set_download_bps(kbps_to_bps(settings.bt_download_kbps));
+    if let Err(error) = apply_autostart(&app, settings.autostart) {
+        eprintln!("开机启动设置未生效：{error}");
+    }
+    if let Ok(mut current) = state.settings.lock() {
+        *current = settings.clone();
+    }
+    Ok(settings)
+}
+
+fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let launcher = app.autolaunch();
+    let result = if enabled {
+        launcher.enable()
+    } else {
+        launcher.disable()
+    };
+    result.map_err(|e| e.to_string())
+}
+
+/// 打开本地文件/目录（下载目录与播放）。绕过前端 opener ACL，
+/// 因为自定义下载目录不受 $DOWNLOAD/Mizuki/** 范围限制。
+#[tauri::command]
+fn open_local_path(path: String) -> Result<(), String> {
+    let path = PathBuf::from(&path);
+    if !path.exists() {
+        return Err("文件或目录不存在，可能已被移动或删除".into());
+    }
+    tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_comments(
     subject_id: i64,
     offset: u32,
@@ -1162,20 +1481,30 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             let download_path = app.path().download_dir()?.join("Mizuki");
             std::fs::create_dir_all(&download_path)?;
+            let db = Database::open(&data.join("mizuki.sqlite3")).map_err(std::io::Error::other)?;
+            let settings = load_settings(&db);
+            if let Some(dir) = &settings.download_dir {
+                // 自定义目录可能被用户移除，启动时静默重建。
+                let _ = std::fs::create_dir_all(dir);
+            }
             let bt = tauri::async_runtime::block_on(Session::new_with_opts(
                 download_path.clone(),
-                torrent_session_options(),
+                torrent_session_options(&settings),
             ))?;
             let client = reqwest::Client::builder()
                 .user_agent(format!("Mizuki/{}", env!("CARGO_PKG_VERSION")))
                 .timeout(std::time::Duration::from_secs(15))
                 .build()?;
             app.manage(AppState {
-                db: Database::open(&data.join("mizuki.sqlite3")).map_err(std::io::Error::other)?,
+                db,
                 client,
                 bt,
                 handles: Mutex::new(HashMap::new()),
@@ -1184,7 +1513,11 @@ pub fn run() {
                 trackers: tokio::sync::RwLock::new(None),
                 download_gate: tokio::sync::Mutex::new(()),
                 sync_notify: tokio::sync::Notify::new(),
+                settings: Mutex::new(settings.clone()),
             });
+            if let Err(error) = apply_autostart(app.handle(), settings.autostart) {
+                eprintln!("开机启动设置未生效：{error}");
+            }
 
             // 同步队列 worker：处理到期的 Bangumi 写回，空闲时等通知或 45 秒轮询。
             let sync_app = app.handle().clone();
@@ -1201,6 +1534,7 @@ pub fn run() {
             let restore_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = restore_app.state::<AppState>();
+                let restore_output_folder = state.download_dir().to_string_lossy().into_owned();
                 let _guard = state.download_gate.lock().await;
                 // 后台预热 TrackerList，避免第一次手动下载被网络探测阻塞。
                 let trackers = tracker_list(&state).await;
@@ -1208,6 +1542,7 @@ pub fn run() {
                     for (id, source, previous_state) in tasks {
                         let options = AddTorrentOptions {
                             overwrite: true,
+                            output_folder: Some(restore_output_folder.clone()),
                             trackers: (!source.starts_with("magnet:") && !trackers.is_empty())
                                 .then_some(trackers.clone()),
                             ..Default::default()
@@ -1295,8 +1630,16 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event
                 && !EXITING.load(Ordering::SeqCst)
             {
-                api.prevent_close();
-                let _ = window.hide();
+                // 设置允许时关闭窗口仅隐藏到托盘；否则真正退出。
+                let close_to_tray = window
+                    .app_handle()
+                    .try_state::<AppState>()
+                    .map(|state| state.settings().close_to_tray)
+                    .unwrap_or(true);
+                if close_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1321,8 +1664,11 @@ pub fn run() {
             add_download,
             pause_download,
             resume_download,
-            download_playback_path,
             delete_download,
+            download_playback_files,
+            open_local_path,
+            get_settings,
+            save_settings,
             set_collection,
             set_watch_progress,
             get_sync_status,
