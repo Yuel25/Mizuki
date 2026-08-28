@@ -1,0 +1,21 @@
+.manual-download {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-bottom: 18px;
+  padding: 13px;
+  border: 1px solid #2d2939;
+  border-radius: 10px;
+  background: #14121d;
+}
+.manual-download input {
+  min-width: 0;
+  padding: 9px 11px;
+  border: 1px solid #353044;
+  border-radius: 7px;
+  outline: none;
+  color: #eeeaf6;
+  background: #0e0d15;
+  font-size: 10px;
+}
+.manual-download input:focus { border-color: #7650df; }

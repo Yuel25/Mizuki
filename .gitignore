@@ -1,0 +1,7 @@
+/node_modules
+/dist
+/src-tauri/target
+/oauth-broker/target
+/.env
+*.sqlite3
+*.log

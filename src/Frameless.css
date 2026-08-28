@@ -1,0 +1,209 @@
+body {
+  overflow: hidden;
+}
+
+.window-root {
+  position: relative;
+  height: 100vh;
+  overflow: hidden;
+  border: 1px solid #302d40;
+  background: #0d0c15;
+}
+
+/* Invisible drag affordance: no visual title bar, but the top edge remains movable. */
+.drag-strip {
+  position: fixed;
+  z-index: 40;
+  top: 1px;
+  right: 139px;
+  left: 1px;
+  height: 12px;
+  cursor: default;
+}
+
+.floating-window-controls {
+  position: fixed;
+  z-index: 50;
+  top: 1px;
+  right: 1px;
+  height: 34px;
+  display: flex;
+}
+
+.floating-window-controls button {
+  width: 46px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  color: #aaa6b5;
+  background: rgba(15, 14, 24, 0.78);
+  cursor: pointer;
+}
+
+.floating-window-controls button:hover {
+  color: #fff;
+  background: #292635;
+}
+
+.floating-window-controls .close-window:hover {
+  background: #c42b3b;
+}
+
+.floating-window-controls i {
+  position: relative;
+  display: block;
+  width: 11px;
+  height: 11px;
+}
+
+.minimize-icon::after {
+  content: "";
+  position: absolute;
+  right: 1px;
+  bottom: 2px;
+  left: 1px;
+  height: 1px;
+  background: currentColor;
+}
+
+.maximize-icon { border: 1px solid currentColor; }
+
+.close-icon::before,
+.close-icon::after {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 5px;
+  width: 1px;
+  height: 13px;
+  background: currentColor;
+}
+
+.close-icon::before { transform: rotate(45deg); }
+.close-icon::after { transform: rotate(-45deg); }
+
+.app-shell {
+  height: calc(100vh - 2px);
+  min-height: 0;
+  margin-top: 0;
+  overflow: hidden;
+}
+
+.sidebar {
+  inset: 1px auto 1px 1px;
+  padding-top: 28px;
+}
+
+.brand {
+  user-select: none;
+}
+
+.profile-entry {
+  width: 100%;
+  margin-top: auto;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: 38px 1fr;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  color: #d8d4e2;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.profile-entry:hover {
+  border-color: #342d46;
+  background: #1a1725;
+}
+
+.profile-entry > img,
+.default-avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.default-avatar {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  color: transparent;
+  background: linear-gradient(145deg, #352a52, #242031);
+}
+
+.default-avatar::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  left: 14px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #9187aa;
+}
+
+.default-avatar::after {
+  content: "";
+  position: absolute;
+  bottom: 6px;
+  left: 9px;
+  width: 20px;
+  height: 11px;
+  border-radius: 12px 12px 5px 5px;
+  background: #9187aa;
+}
+
+.profile-entry b,
+.profile-entry small { display: block; }
+.profile-entry b { max-width: 120px; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.profile-entry small { margin-top: 4px; color: #777183; font-size: 9px; }
+.profile-entry small i { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; }
+
+.app-shell main {
+  height: 100%;
+  overflow-y: auto;
+}
+
+.drawer-backdrop {
+  top: 1px;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #6941bd #17141f;
+}
+
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: #17141f; }
+*::-webkit-scrollbar-thumb { border: 2px solid #17141f; border-radius: 8px; background: #6941bd; }
+*::-webkit-scrollbar-thumb:hover { background: #8b5cf6; }
+
+.avatar-image {
+  width: 45px;
+  height: 45px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.local-data {
+  margin-top: 20px;
+  padding-top: 18px;
+  display: grid;
+  gap: 11px;
+  border-top: 1px solid #292535;
+}
+
+.local-data .section-title h3 { margin: 0; }
+.local-data .section-title span { color: #8b8497; font-size: 10px; }
+.local-data .section-title span.configured { color: #65d4a0; }
+.local-data > p { margin: 0; color: #7d7789; font-size: 11px; line-height: 1.7; }
+.local-data label { display: grid; gap: 6px; color: #8f899c; font-size: 10px; }
+.local-data input { width: 100%; padding: 10px 12px; border: 1px solid #353044; border-radius: 8px; outline: none; color: #eeeaf6; background: #0e0d15; }
+.local-data input:focus { border-color: #7650df; box-shadow: 0 0 0 2px #7650df25; }
+.token-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.auth-message { color: #b99aff; font-size: 10px; line-height: 1.5; }

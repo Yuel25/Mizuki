@@ -1,0 +1,92 @@
+.comment-list {
+  display: grid;
+  gap: 10px;
+}
+
+.comment-user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.comment-user img,
+.comment-user > span {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.comment-user > span {
+  display: grid;
+  place-items: center;
+  color: #83769f;
+  background: #282331;
+}
+
+.comment-user em {
+  margin-left: auto;
+  color: #ffca68;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.comment-user i {
+  padding: 2px 5px;
+  border-radius: 4px;
+  color: #ff9bac;
+  background: #542a37;
+  font-size: 9px;
+  font-style: normal;
+}
+
+.comment p { white-space: pre-wrap; }
+.summary.muted, .episode-total { color: #756f80; }
+.episode-total { margin: 8px 0 0; font-size: 10px; }
+.detail-error { display: block; margin-top: 8px; color: #ff8597; }
+
+.detail-drawer .drawer-close {
+  position: sticky;
+  top: 0;
+  left: 0;
+  right: auto;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  padding: 7px 10px 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #9b95a9;
+  background: #12101be8;
+  backdrop-filter: blur(12px);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.detail-drawer .drawer-close span {
+  color: #c7c1d2;
+  font-size: 18px;
+  transition: transform .16s ease;
+}
+
+.detail-drawer .drawer-close:hover {
+  border-color: #393348;
+  color: #f0edf6;
+  background: #201b2b;
+}
+
+.detail-drawer .drawer-close:hover span { transform: translateX(-2px); }
+.detail-drawer .detail-hero { margin-top: 18px; }
+
+.today-section { margin-top: 30px; }
+.weekday-tabs + .today-section { margin-top: 4px; }
+.today-section + .today-section { padding-top: 28px; border-top: 1px solid #292637; }
+.today-section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 17px; }
+.today-section-title h2 { margin: 0 0 4px; color: #dcd8e5; font-size: 16px; }
+.today-section-title p { margin: 0; color: #746f80; font-size: 10px; }
+.today-section-title > span { min-width: 25px; padding: 4px 8px; border-radius: 12px; color: #8c849b; background: #1b1824; font-size: 10px; text-align: center; }
+.today-section.featured { padding: 19px; border: 1px solid #3a2b5c; border-radius: 14px; background: linear-gradient(135deg, #211831b8, #15121e80); }
+.today-section.featured .today-section-title h2 { color: #b99aff; }
+.today-section.featured .today-section-title > span { color: #c9b5ff; background: #6f46df42; }
