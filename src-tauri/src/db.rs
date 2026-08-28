@@ -26,6 +26,15 @@ impl Database {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let connection = Connection::open(path).map_err(|e| e.to_string())?;
+        Self::initialize(connection)
+    }
+
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self, String> {
+        Self::initialize(Connection::open_in_memory().map_err(|e| e.to_string())?)
+    }
+
+    fn initialize(connection: Connection) -> Result<Self, String> {
         connection.execute_batch("PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS rss_feeds(id TEXT PRIMARY KEY,title TEXT NOT NULL,url TEXT NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,last_checked_at TEXT,auto_download INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS rss_items(guid TEXT PRIMARY KEY,feed_id TEXT NOT NULL,title TEXT NOT NULL,link TEXT NOT NULL,torrent TEXT,published_at TEXT,seen_at TEXT NOT NULL,downloaded INTEGER NOT NULL DEFAULT 0,download_id TEXT);
@@ -412,5 +421,127 @@ impl Database {
             )
             .map_err(|e| e.to_string())?;
         serde_json::from_str(&payload).map_err(|e| e.to_string())
+    }
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, String> {
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        match connection.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bangumi::subject_from_v0;
+
+    fn db() -> Database {
+        Database::open_in_memory().expect("in-memory database")
+    }
+
+    #[test]
+    fn collection_progress_upsert_keeps_latest_values() {
+        let db = db();
+        db.set_collection_progress(7, "doing", 3).unwrap();
+        db.set_collection_progress(7, "on_hold", 5).unwrap();
+        let collections = db.collections().unwrap();
+        assert_eq!(
+            collections.get(&7),
+            Some(&("on_hold".to_string(), 5)),
+            "同一条目的旧状态与进度必须被覆盖"
+        );
+    }
+
+    #[test]
+    fn collection_without_progress_defaults_watched_to_zero() {
+        let db = db();
+        db.set_collection(9, "wish").unwrap();
+        assert_eq!(db.collections().unwrap().get(&9), Some(&("wish".to_string(), 0)));
+    }
+
+    #[test]
+    fn cached_subject_roundtrip_preserves_payload() {
+        let db = db();
+        let subject = serde_json::json!({"id": 11, "name": "Old Anime", "eps": 24});
+        db.cache_subject(11, &subject).unwrap();
+        // 同一条目重复导入时覆盖旧缓存，与收藏同步的分页重复安全。
+        db.cache_subject(11, &serde_json::json!({"id": 11, "name": "Old Anime", "eps": 25}))
+            .unwrap();
+        let cached = db.cached_subjects().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0]["eps"], 25);
+    }
+
+    #[test]
+    fn collections_merge_into_cached_subjects_like_get_calendar() {
+        // 复现 get_calendar 的合并路径：缓存条目 + 本地收藏 => 追番页可展示旧番。
+        let db = db();
+        db.cache_subject(21, &serde_json::json!({"id": 21, "name": "Cached", "name_cn": "缓存番剧", "eps": 12}))
+            .unwrap();
+        db.cache_subject(22, &serde_json::json!({"id": 22, "name": "No Collection"}))
+            .unwrap();
+        db.set_collection_progress(21, "doing", 4).unwrap();
+        let collections = db.collections().unwrap();
+        let merged: Vec<_> = db
+            .cached_subjects()
+            .unwrap()
+            .iter()
+            .filter_map(|value| {
+                let id = value.get("id")?.as_i64()?;
+                let (collection, watched) = collections.get(&id)?;
+                Some(subject_from_v0(value, Some(collection.clone()), *watched))
+            })
+            .collect();
+        assert_eq!(merged.len(), 1, "没有本地收藏的缓存条目不应出现在追番页");
+        assert_eq!(merged[0].id, 21);
+        assert_eq!(merged[0].collection.as_deref(), Some("doing"));
+        assert_eq!(merged[0].watched, 4);
+        assert_eq!(merged[0].episodes, 12);
+    }
+
+    #[test]
+    fn calendar_cache_roundtrip() {
+        let db = db();
+        assert!(db.cached_calendar().is_err(), "未缓存时应返回错误而非空数据");
+        let subjects = vec![subject_from_v0(
+            &serde_json::json!({"id": 31, "name": "Aired", "air_weekday": 3}),
+            None,
+            0,
+        )];
+        db.save_calendar(&subjects).unwrap();
+        let cached = db.cached_calendar().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].id, 31);
+    }
+
+    #[test]
+    fn settings_roundtrip_and_overwrite() {
+        let db = db();
+        assert_eq!(db.get_setting("missing").unwrap(), None);
+        db.set_setting("rss_interval_minutes", "15").unwrap();
+        db.set_setting("rss_interval_minutes", "30").unwrap();
+        assert_eq!(
+            db.get_setting("rss_interval_minutes").unwrap().as_deref(),
+            Some("30")
+        );
     }
 }

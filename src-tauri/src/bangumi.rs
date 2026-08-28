@@ -127,19 +127,46 @@ pub async fn profile(client: &reqwest::Client, token: &str) -> Result<Value, Str
         .await
         .map_err(|e| e.to_string())
 }
+/// Bangumi 收藏 type（1-5）与本地状态名互转，是前后端字段约定的唯一来源。
+pub fn collection_slug(kind: i64) -> Option<&'static str> {
+    match kind {
+        1 => Some("wish"),
+        2 => Some("collect"),
+        3 => Some("doing"),
+        4 => Some("on_hold"),
+        5 => Some("dropped"),
+        _ => None,
+    }
+}
+
+pub fn collection_kind(slug: &str) -> Option<i64> {
+    match slug {
+        "wish" => Some(1),
+        "collect" => Some(2),
+        "doing" => Some(3),
+        "on_hold" => Some(4),
+        "dropped" => Some(5),
+        _ => None,
+    }
+}
+
+/// 收藏接口返回分页对象 `{ data, total, limit, offset }`。
+/// 历史上曾误按数组解析导致导入为空，这里固定只认对象形状。
+pub fn collection_page_data(page: &Value) -> Vec<Value> {
+    page.get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub async fn set_collection(
     client: &reqwest::Client,
     token: &str,
     subject_id: i64,
     collection: &str,
 ) -> Result<(), String> {
-    let kind = match collection {
-        "wish" => 1,
-        "collect" => 2,
-        "doing" => 3,
-        "on_hold" => 4,
-        "dropped" => 5,
-        _ => return Err("收藏状态无效".into()),
+    let Some(kind) = collection_kind(collection) else {
+        return Err("收藏状态无效".into());
     };
     client
         .post(format!(
@@ -176,11 +203,7 @@ pub async fn collections(
             .json()
             .await
             .map_err(|e| e.to_string())?;
-        let data = page
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let data = collection_page_data(&page);
         let count = data.len();
         all.extend(data);
         if count < 50 {
@@ -250,5 +273,53 @@ mod tests {
         assert_eq!(subject.rank, Some(456));
         assert_eq!(subject.summary, "简介");
         assert_eq!(subject.watched, 3)
+    }
+    #[test]
+    fn reads_paginated_collection_object() {
+        let page = serde_json::json!({
+            "data": [
+                {"subject_id": 7, "type": 3, "ep_status": 4},
+                {"subject_id": 9, "type": 1, "ep_status": 0}
+            ],
+            "total": 12,
+            "limit": 50,
+            "offset": 0
+        });
+        let data = collection_page_data(&page);
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["subject_id"], 7);
+        assert_eq!(page["total"], 12);
+    }
+    #[test]
+    fn ignores_legacy_array_shaped_collection_response() {
+        // 旧解析按数组读取分页响应导致导入恒为空；数组形状必须得到空结果而不是 panic。
+        let page = serde_json::json!([{"subject_id": 7, "type": 3}]);
+        assert!(collection_page_data(&page).is_empty());
+    }
+    #[test]
+    fn short_page_marks_the_final_offset() {
+        // 每页 50 条：不足一页说明已到末尾，循环必须停止。
+        let full_page = collection_page_data(&serde_json::json!({
+            "data": vec![serde_json::Value::Null; 50]
+        }));
+        let last_page = collection_page_data(&serde_json::json!({
+            "data": vec![serde_json::Value::Null; 17]
+        }));
+        assert_eq!(full_page.len(), 50);
+        assert_eq!(last_page.len(), 17);
+        assert!(full_page.len() >= 50);
+        assert!(last_page.len() < 50);
+    }
+    #[test]
+    fn collection_kind_and_slug_are_inverses() {
+        for kind in 1..=5 {
+            let slug = collection_slug(kind).expect("known kind");
+            assert_eq!(collection_kind(slug), Some(kind));
+        }
+        assert_eq!(collection_slug(0), None);
+        assert_eq!(collection_slug(9), None);
+        assert_eq!(collection_kind("wish"), Some(1));
+        assert_eq!(collection_kind("doing"), Some(3));
+        assert_eq!(collection_kind("unknown"), None);
     }
 }

@@ -119,6 +119,38 @@ fn subject_from_cache(value: &serde_json::Value) -> Subject {
         .unwrap_or_else(|_| bangumi::subject_from_v0(value, None, 0))
 }
 
+/// 周表 + 本地收藏 + Bangumi 收藏缓存条目 => 今日/追番页的完整条目列表。
+/// 缓存条目只有已存在本地收藏时才出现（air_weekday 为 -1，仅用于追番页）。
+fn merge_calendar_with_collections(
+    mut subjects: Vec<Subject>,
+    cached: Vec<serde_json::Value>,
+    collections: &HashMap<i64, (String, i64)>,
+) -> Vec<Subject> {
+    for subject in &mut subjects {
+        if let Some((collection, watched)) = collections.get(&subject.id) {
+            subject.collection = Some(collection.clone());
+            subject.watched = *watched;
+        }
+    }
+    let mut known: std::collections::HashSet<i64> =
+        subjects.iter().map(|subject| subject.id).collect();
+    for value in cached {
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        if known.insert(id)
+            && let Some((collection, watched)) = collections.get(&id).cloned()
+        {
+            let mut subject = subject_from_cache(&value);
+            subject.collection = Some(collection);
+            subject.watched = watched;
+            subjects.push(subject);
+        }
+    }
+    subjects
+}
+
 #[tauri::command]
 async fn get_bangumi_profile(
     state: tauri::State<'_, AppState>,
@@ -170,13 +202,10 @@ async fn sync_bangumi_collections(state: tauri::State<'_, AppState>) -> Result<u
             .get("subject_id")
             .and_then(|v| v.as_i64())
             .unwrap_or_default();
-        let collection = match item.get("type").and_then(|v| v.as_i64()) {
-            Some(1) => "wish",
-            Some(2) => "collect",
-            Some(3) => "doing",
-            Some(4) => "on_hold",
-            Some(5) => "dropped",
-            _ => continue,
+        let Some(collection) =
+            bangumi::collection_slug(item.get("type").and_then(|v| v.as_i64()).unwrap_or(0))
+        else {
+            continue;
         };
         let watched = item
             .get("ep_status")
@@ -192,7 +221,7 @@ async fn sync_bangumi_collections(state: tauri::State<'_, AppState>) -> Result<u
 
 #[tauri::command]
 async fn get_calendar(state: tauri::State<'_, AppState>) -> Result<CalendarPayload, String> {
-    let (mut subjects, stale, warning, refreshed_at) = match bangumi::calendar(&state.client).await
+    let (subjects, stale, warning, refreshed_at) = match bangumi::calendar(&state.client).await
     {
         Ok(subjects) => {
             state.db.save_calendar(&subjects)?;
@@ -206,31 +235,11 @@ async fn get_calendar(state: tauri::State<'_, AppState>) -> Result<CalendarPaylo
                 None,
             ),
             _ => return Err(error),
-        },
+        }
     };
     let collections = state.db.collections()?;
-    for subject in &mut subjects {
-        if let Some((collection, watched)) = collections.get(&subject.id) {
-            subject.collection = Some(collection.clone());
-            subject.watched = *watched;
-        }
-    }
-    let mut known: std::collections::HashSet<i64> =
-        subjects.iter().map(|subject| subject.id).collect();
-    for value in state.db.cached_subjects()? {
-        let id = value
-            .get("id")
-            .and_then(|item| item.as_i64())
-            .unwrap_or_default();
-        if known.insert(id)
-            && let Some((collection, watched)) = collections.get(&id).cloned()
-        {
-            let mut subject = subject_from_cache(&value);
-            subject.collection = Some(collection);
-            subject.watched = watched;
-            subjects.push(subject);
-        }
-    }
+    let subjects =
+        merge_calendar_with_collections(subjects, state.db.cached_subjects()?, &collections);
     Ok(CalendarPayload {
         subjects,
         refreshed_at,
@@ -448,6 +457,71 @@ async fn prepare_torrent_input(
         return Err("订阅地址返回的不是有效 .torrent 文件".into());
     }
     Ok((source.to_owned(), AddTorrent::from_bytes(bytes)))
+}
+
+#[cfg(test)]
+mod calendar_merge_tests {
+    use super::merge_calendar_with_collections;
+    use crate::bangumi::subject_from_v0;
+    use crate::models::Subject;
+    use std::collections::HashMap;
+
+    fn cached(value: serde_json::Value) -> serde_json::Value {
+        value
+    }
+
+    fn collection(id: i64, state: &str, watched: i64) -> (i64, (String, i64)) {
+        (id, (state.to_string(), watched))
+    }
+
+    #[test]
+    fn calendar_subjects_pick_up_local_collection_and_watched() {
+        let mut subject = subject_from_v0(&serde_json::json!({"id": 1, "name": "A"}), None, 0);
+        subject.air_weekday = 2;
+        let collections = HashMap::from([collection(1, "doing", 5)]);
+        let merged = merge_calendar_with_collections(vec![subject], Vec::new(), &collections);
+        assert_eq!(merged[0].collection.as_deref(), Some("doing"));
+        assert_eq!(merged[0].watched, 5);
+        assert_eq!(merged[0].air_weekday, 2, "合并不得破坏周表放送日");
+    }
+
+    #[test]
+    fn cached_collection_entries_are_appended_once() {
+        let cached = vec![
+            cached(serde_json::json!({"id": 2, "name": "Old", "name_cn": "旧番", "eps": 24})),
+            cached(serde_json::json!({"id": 2, "name": "Old", "name_cn": "旧番", "eps": 24})),
+        ];
+        let collections = HashMap::from([collection(2, "collect", 24)]);
+        let merged = merge_calendar_with_collections(Vec::new(), cached, &collections);
+        assert_eq!(merged.len(), 1, "重复缓存条目只出现一次");
+        assert_eq!(merged[0].name_cn, "旧番");
+        assert_eq!(merged[0].watched, 24);
+    }
+
+    #[test]
+    fn cached_entries_without_local_collection_are_hidden() {
+        let cached = vec![
+            cached(serde_json::json!({"id": 3, "name": "X"})),
+            cached(serde_json::json!({"id": 4, "name": "Y"})),
+        ];
+        let collections = HashMap::from([collection(4, "wish", 0)]);
+        let merged = merge_calendar_with_collections(Vec::new(), cached, &collections);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, 4);
+    }
+
+    #[test]
+    fn cached_payload_falls_back_to_v0_parser() {
+        // cached_subjects 存的是 Bangumi 原始 JSON，字段名与 Subject 不同也能解析。
+        let value = serde_json::json!({"id": 5, "name": "Raw", "name_cn": "原始", "rating": {"score": 7.1, "rank": 99}, "eps": 13});
+        let collections = HashMap::from([collection(5, "doing", 1)]);
+        let merged = merge_calendar_with_collections(Vec::new(), vec![value], &collections);
+        assert_eq!(merged.len(), 1);
+        let subject: &Subject = &merged[0];
+        assert_eq!(subject.name_cn, "原始");
+        assert!((subject.score - 7.1).abs() < f64::EPSILON);
+        assert_eq!(subject.episodes, 13);
+    }
 }
 
 #[cfg(test)]
