@@ -274,6 +274,82 @@ pub async fn subject(
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BangumiProfile {
+    username: String,
+    nickname: String,
+    avatar: Option<String>,
+}
+
+fn token_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new("app.mizuki.desktop", "bangumi-access-token").map_err(|e| e.to_string())
+}
+
+/// 凭据管理器中的 Access Token。全项目统一从这里读取。
+pub(crate) fn stored_access_token() -> Option<String> {
+    token_entry()
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn profile_from_value(value: &serde_json::Value) -> BangumiProfile {
+    BangumiProfile {
+        username: value
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .into(),
+        nickname: value
+            .get("nickname")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .into(),
+        avatar: value
+            .pointer("/avatar/large")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn get_bangumi_profile(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<Option<BangumiProfile>, String> {
+    let Some(token) = stored_access_token() else {
+        return Ok(None);
+    };
+    Ok(Some(profile_from_value(
+        &profile(&state.client, &token).await?,
+    )))
+}
+
+#[tauri::command]
+pub(crate) async fn save_bangumi_token(
+    token: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<BangumiProfile, String> {
+    let token = token.trim();
+    if token.is_empty() || token.len() > 512 || token.chars().any(char::is_whitespace) {
+        return Err("Access Token 格式无效".into());
+    }
+    let value = profile(&state.client, token).await?;
+    token_entry()?
+        .set_password(token)
+        .map_err(|e| e.to_string())?;
+    Ok(profile_from_value(&value))
+}
+
+#[tauri::command]
+pub(crate) fn remove_bangumi_token() -> Result<(), String> {
+    let entry = token_entry()?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +432,9 @@ mod tests {
             subject_from_v0(&already_https, None, 0).image.as_deref(),
             Some("https://lain.bgm.tv/pic/cover/x.jpg")
         );
-        assert_eq!(subject_from_v0(&serde_json::json!({"id":3,"name":"C"}), None, 0).image, None);
+        assert_eq!(
+            subject_from_v0(&serde_json::json!({"id":3,"name":"C"}), None, 0).image,
+            None
+        );
     }
 }

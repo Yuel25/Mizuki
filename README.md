@@ -11,7 +11,7 @@ npm install
 npm run tauri dev
 ```
 
-Rust 测试：`cd src-tauri && cargo test --locked`。
+Rust 测试：`cd src-tauri && cargo test --locked`；格式化：Rust 用 `cargo fmt`，前端用 `npm run format`。
 
 ## 本地追番模式
 

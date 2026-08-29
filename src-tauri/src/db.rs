@@ -202,10 +202,7 @@ impl Database {
     }
     /// 按 URL 查找订阅源：用户可能早已手动添加过同一 Mikan 单番地址。
     pub fn feed_by_url(&self, url: &str) -> Result<Option<RssFeed>, String> {
-        Ok(self
-            .list_feeds()?
-            .into_iter()
-            .find(|feed| feed.url == url))
+        Ok(self.list_feeds()?.into_iter().find(|feed| feed.url == url))
     }
     /// 把已有订阅源收编为某条目的追番订阅：关联 subject_id 并确保启用。
     pub fn adopt_feed_as_subscription(&self, id: &str, subject_id: i64) -> Result<(), String> {
@@ -277,11 +274,8 @@ impl Database {
             [subject_id],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM rss_feeds WHERE subject_id=?1",
-            [subject_id],
-        )
-        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM rss_feeds WHERE subject_id=?1", [subject_id])
+            .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
     /// 按番剧聚合订阅源的资源状态：正在下载 / 已下载 / 有未下载的匹配新资源。
@@ -551,7 +545,10 @@ impl Database {
     }
 
     /// (source, output_path, playback_path)：播放回退恢复会话时使用。
-    pub fn download_by_id(&self, id: &str) -> Result<Option<(String, String, Option<String>)>, String> {
+    pub fn download_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, String, Option<String>)>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
         match connection.query_row(
             "SELECT source,output_path,playback_path FROM downloads WHERE id=?1",
@@ -575,12 +572,7 @@ impl Database {
         let mut query=connection.prepare("SELECT id,source,state,output_path FROM downloads WHERE state IN ('queued','downloading','paused')").map_err(|e|e.to_string())?;
         query
             .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
@@ -688,11 +680,9 @@ impl Database {
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
-        match connection.query_row(
-            "SELECT value FROM settings WHERE key=?1",
-            [key],
-            |row| row.get::<_, String>(0),
-        ) {
+        match connection.query_row("SELECT value FROM settings WHERE key=?1", [key], |row| {
+            row.get::<_, String>(0)
+        }) {
             Ok(value) => Ok(Some(value)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.to_string()),
@@ -847,7 +837,10 @@ mod tests {
     fn collection_without_progress_defaults_watched_to_zero() {
         let db = db();
         db.set_collection(9, "wish").unwrap();
-        assert_eq!(db.collections().unwrap().get(&9), Some(&("wish".to_string(), 0)));
+        assert_eq!(
+            db.collections().unwrap().get(&9),
+            Some(&("wish".to_string(), 0))
+        );
     }
 
     #[test]
@@ -856,8 +849,11 @@ mod tests {
         let subject = serde_json::json!({"id": 11, "name": "Old Anime", "eps": 24});
         db.cache_subject(11, &subject).unwrap();
         // 同一条目重复导入时覆盖旧缓存，与收藏同步的分页重复安全。
-        db.cache_subject(11, &serde_json::json!({"id": 11, "name": "Old Anime", "eps": 25}))
-            .unwrap();
+        db.cache_subject(
+            11,
+            &serde_json::json!({"id": 11, "name": "Old Anime", "eps": 25}),
+        )
+        .unwrap();
         let cached = db.cached_subjects().unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0]["eps"], 25);
@@ -867,8 +863,11 @@ mod tests {
     fn collections_merge_into_cached_subjects_like_get_calendar() {
         // 复现 get_calendar 的合并路径：缓存条目 + 本地收藏 => 追番页可展示旧番。
         let db = db();
-        db.cache_subject(21, &serde_json::json!({"id": 21, "name": "Cached", "name_cn": "缓存番剧", "eps": 12}))
-            .unwrap();
+        db.cache_subject(
+            21,
+            &serde_json::json!({"id": 21, "name": "Cached", "name_cn": "缓存番剧", "eps": 12}),
+        )
+        .unwrap();
         db.cache_subject(22, &serde_json::json!({"id": 22, "name": "No Collection"}))
             .unwrap();
         db.set_collection_progress(21, "doing", 4).unwrap();
@@ -893,7 +892,10 @@ mod tests {
     #[test]
     fn calendar_cache_roundtrip() {
         let db = db();
-        assert!(db.cached_calendar().is_err(), "未缓存时应返回错误而非空数据");
+        assert!(
+            db.cached_calendar().is_err(),
+            "未缓存时应返回错误而非空数据"
+        );
         let subjects = vec![subject_from_v0(
             &serde_json::json!({"id": 31, "name": "Aired", "air_weekday": 3}),
             None,
@@ -909,8 +911,10 @@ mod tests {
     fn detail_cache_roundtrip_and_overwrite() {
         let db = db();
         assert!(db.cached_detail(11).unwrap().is_none());
-        db.save_detail(11, &serde_json::json!({"id": 11, "eps": 12})).unwrap();
-        db.save_detail(11, &serde_json::json!({"id": 11, "eps": 13})).unwrap();
+        db.save_detail(11, &serde_json::json!({"id": 11, "eps": 12}))
+            .unwrap();
+        db.save_detail(11, &serde_json::json!({"id": 11, "eps": 13}))
+            .unwrap();
         let (payload, updated_at) = db.cached_detail(11).unwrap().expect("cached detail");
         assert_eq!(payload["eps"], 13, "同条目重复刷新覆盖旧详情");
         assert!(chrono::DateTime::parse_from_rfc3339(&updated_at).is_ok());
@@ -932,7 +936,10 @@ mod tests {
         RssFeed {
             id: id.into(),
             title: "测试订阅".into(),
-            url: format!("https://mikanani.me/RSS/Bangumi?bangumiId={}", subject_id.unwrap_or_default()),
+            url: format!(
+                "https://mikanani.me/RSS/Bangumi?bangumiId={}",
+                subject_id.unwrap_or_default()
+            ),
             enabled: true,
             last_checked_at: None,
             rule: crate::models::FeedRule::default(),
@@ -957,12 +964,11 @@ mod tests {
     #[test]
     fn migrations_leave_user_version_at_latest() {
         let db = db();
-        let version: i64 = db
-            .0
-            .lock()
-            .unwrap()
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
+        let version: i64 =
+            db.0.lock()
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
@@ -973,12 +979,18 @@ mod tests {
         db.add_feed(&subject_feed("f2", None)).unwrap();
         db.insert_rss_items("f1", &[rss_item("g1", "[X] 番剧 01 [1080p]")])
             .unwrap();
-        assert_eq!(db.feed_for_subject(7).unwrap().map(|feed| feed.id), Some("f1".into()));
+        assert_eq!(
+            db.feed_for_subject(7).unwrap().map(|feed| feed.id),
+            Some("f1".into())
+        );
         assert!(db.feed_for_subject(8).unwrap().is_none());
         db.delete_feeds_for_subject(7).unwrap();
         assert!(db.feed_for_subject(7).unwrap().is_none());
         assert_eq!(db.list_feeds().unwrap().len(), 1, "普通订阅不受影响");
-        assert!(db.list_rss_items(Some("f1"), 10).unwrap().is_empty(), "取消订阅要清掉资源列表");
+        assert!(
+            db.list_rss_items(Some("f1"), 10).unwrap().is_empty(),
+            "取消订阅要清掉资源列表"
+        );
     }
 
     #[test]
@@ -1044,20 +1056,30 @@ mod tests {
         db.enqueue_collection_sync(7, "doing", Some(3)).unwrap();
         db.enqueue_collection_sync(7, "collect", Some(12)).unwrap();
         db.enqueue_collection_sync(8, "wish", None).unwrap();
-        assert_eq!(db.pending_sync_count().unwrap(), 2, "同一条目只保留最新改动");
+        assert_eq!(
+            db.pending_sync_count().unwrap(),
+            2,
+            "同一条目只保留最新改动"
+        );
         let due = db.due_sync_entries(10).unwrap();
         let entry = due.iter().find(|e| e.subject_id == 7).unwrap();
         assert_eq!(entry.collection, "collect");
         assert_eq!(entry.ep, Some(12));
         assert_eq!(entry.attempts, 0, "重新入队要重置退避计数");
         // 失败进入退避：到期时间推到远期后不再被取出。
-        db.mark_sync_attempt(entry.id, 1, "2999-01-01T00:00:00+00:00", "Bangumi 同步失败：500")
-            .unwrap();
-        assert!(db
-            .due_sync_entries(10)
-            .unwrap()
-            .iter()
-            .all(|e| e.subject_id != 7));
+        db.mark_sync_attempt(
+            entry.id,
+            1,
+            "2999-01-01T00:00:00+00:00",
+            "Bangumi 同步失败：500",
+        )
+        .unwrap();
+        assert!(
+            db.due_sync_entries(10)
+                .unwrap()
+                .iter()
+                .all(|e| e.subject_id != 7)
+        );
         let (pending, last_error, last_attempt_at) = db.sync_queue_summary().unwrap();
         assert_eq!(pending, 2);
         assert_eq!(last_error.as_deref(), Some("Bangumi 同步失败：500"));

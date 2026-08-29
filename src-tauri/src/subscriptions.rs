@@ -81,25 +81,41 @@ mod tests {
 
     #[test]
     fn rss_states_take_priority_over_heuristics() {
-        let rss = SubjectRssState { downloading: true, completed: true, pending: true };
+        let rss = SubjectRssState {
+            downloading: true,
+            completed: true,
+            pending: true,
+        };
         assert_eq!(
             compute_update_state(Some("collect"), 12, 12, 1, 1, Some(&rss)),
             "downloading",
             "下载中优先于其他状态"
         );
-        let rss = SubjectRssState { downloading: false, completed: true, pending: true };
+        let rss = SubjectRssState {
+            downloading: false,
+            completed: true,
+            pending: true,
+        };
         assert_eq!(
             compute_update_state(Some("doing"), 3, 12, 1, 1, Some(&rss)),
             "published",
             "已有下载但存在未下载的新资源时，有更新不能被已下载挡住"
         );
-        let rss = SubjectRssState { downloading: false, completed: true, pending: false };
+        let rss = SubjectRssState {
+            downloading: false,
+            completed: true,
+            pending: false,
+        };
         assert_eq!(
             compute_update_state(Some("collect"), 12, 12, 1, 1, Some(&rss)),
             "completed",
             "匹配资源全部下载完才显示已下载"
         );
-        let rss = SubjectRssState { downloading: false, completed: false, pending: true };
+        let rss = SubjectRssState {
+            downloading: false,
+            completed: false,
+            pending: true,
+        };
         assert_eq!(
             compute_update_state(Some("collect"), 12, 12, 3, 3, Some(&rss)),
             "published"
@@ -109,11 +125,26 @@ mod tests {
     #[test]
     fn airing_today_heuristic_only_for_unfinished_doing() {
         // 在看 + 今天放送 + 没看完 => 有更新。
-        assert_eq!(compute_update_state(Some("doing"), 3, 12, 2, 2, None), "published");
+        assert_eq!(
+            compute_update_state(Some("doing"), 3, 12, 2, 2, None),
+            "published"
+        );
         // 看完、不在看、非今天放送、未知集数都不提示。
-        assert_eq!(compute_update_state(Some("doing"), 12, 12, 2, 2, None), "none");
-        assert_eq!(compute_update_state(Some("wish"), 0, 12, 2, 2, None), "none");
-        assert_eq!(compute_update_state(Some("doing"), 3, 12, 3, 2, None), "none");
-        assert_eq!(compute_update_state(Some("doing"), 3, 0, 2, 2, None), "none");
+        assert_eq!(
+            compute_update_state(Some("doing"), 12, 12, 2, 2, None),
+            "none"
+        );
+        assert_eq!(
+            compute_update_state(Some("wish"), 0, 12, 2, 2, None),
+            "none"
+        );
+        assert_eq!(
+            compute_update_state(Some("doing"), 3, 12, 3, 2, None),
+            "none"
+        );
+        assert_eq!(
+            compute_update_state(Some("doing"), 3, 0, 2, 2, None),
+            "none"
+        );
     }
 }

@@ -1,11 +1,6 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getVersion } from "@tauri-apps/api/app";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 import "./Frameless.css";
 import "./Detail.css";
@@ -14,147 +9,388 @@ import "./DownloadExtras.css";
 import "./RssGroups.css";
 import "./Enhancements.css";
 import "./Theme.css";
+import { DetailDrawer } from "./components/DetailDrawer";
+import { SubjectGrid, SkeletonGrid, TodaySection } from "./components/SubjectCard";
+import { WindowControls } from "./components/WindowControls";
+import { collectionLabels, jstToday, nav, weekdays } from "./lib";
+import { DownloadsPage } from "./pages/DownloadsPage";
+import { RssPage } from "./pages/RssPage";
+import { SearchPage } from "./pages/SearchPage";
+import { SettingsPage } from "./pages/SettingsPage";
+import type {
+  AppSettings,
+  BangumiProfile,
+  CalendarPayload,
+  Collection,
+  DownloadTask,
+  RssFeed,
+  RssItem,
+  Subject,
+  SyncStatus,
+  View,
+} from "./types";
 
-type View = "today" | "search" | "library" | "rss" | "downloads" | "settings";
-type Collection = "wish" | "doing" | "collect" | "on_hold" | "dropped";
-type Theme = "dark" | "light";
-interface Subject { id:number; name:string; nameCn:string; summary:string; image:string|null; score:number; rank:number|null; airWeekday:number; collection:Collection|null; episodes:number; watched:number; updateState:"none"|"published"|"downloading"|"completed" }
-interface DownloadTask { id:string; title:string; episode:string; progress:number; downSpeed:number; upSpeed:number; state:"queued"|"downloading"|"paused"|"completed"|"failed"; outputPath:string; playbackPath?:string|null }
-interface RssFeed { id:string; title:string; url:string; enabled:boolean; lastCheckedAt:string|null; rule:{ includes:string[]; excludes:string[]; resolution:string|null; subtitleGroup:string|null; autoDownload:boolean }; subjectId?:number|null }
-interface RssItem { guid:string; feedId:string; title:string; link:string; torrent:string|null; publishedAt:string|null; downloaded:boolean; download:{taskId:string;state:DownloadTask["state"];progress:number;active:boolean}|null; matchesRule:boolean }
-interface BangumiProfile { username:string; nickname:string; avatar:string|null }
-interface SyncStatus { pending:number; lastError:string|null; lastAttemptAt:string|null }
-interface SubjectDetail { summary?:string; total_episodes?:number; eps?:number; rating?:{score?:number;rank?:number}; images?:{large?:string;common?:string} }
-interface BangumiComment { id:number; comment:string; rate?:number; spoiler?:boolean; user?:{username?:string;nickname?:string;avatar?:{small?:string;medium?:string}} }
-interface CommentPage { data?:BangumiComment[]; total?:number }
-interface CalendarPayload { subjects:Subject[]; refreshedAt:string|null; stale:boolean; warning:string|null }
-interface SearchPayload { subjects:Subject[]; localOnly:boolean; warning:string|null }
-interface BatchDownloadResult { added:number; reused:number; failed:number; errors:string[] }
-interface AppSettings { btListenPort:number; btUploadKbps:number; btDownloadKbps:number; btPeerLimit:number; maxConcurrentDownloads:number; stopSeedingOnComplete:boolean; rssIntervalMinutes:number; downloadDir:string|null; autostart:boolean; closeToTray:boolean }
-interface PlaybackFile { index:number; name:string; size:number; path:string }
-
-const nav:{id:View;label:string;icon:string}[]=[{id:"today",label:"今日",icon:"◔"},{id:"search",label:"搜索",icon:"⌕"},{id:"library",label:"追番",icon:"◇"},{id:"rss",label:"RSS",icon:"◒"},{id:"downloads",label:"下载",icon:"⇩"},{id:"settings",label:"设置",icon:"⚙"}];
-const weekdays=["周一","周二","周三","周四","周五","周六","周日"];
-const collectionLabels:Record<Collection,string>={wish:"想看",doing:"在看",collect:"看过",on_hold:"搁置",dropped:"抛弃"};
-const formatSpeed=(v:number)=>v>=1e6?`${(v/1e6).toFixed(1)} MB/s`:v>=1e3?`${(v/1e3).toFixed(1)} KB/s`:v?`${Math.round(v)} B/s`:"0 B/s";
-const subjectDetailRequests=new Map<number,Promise<SubjectDetail>>();
-function loadSubjectDetail(subjectId:number){const cached=subjectDetailRequests.get(subjectId);if(cached)return cached;const request=invoke<SubjectDetail>("get_subject_detail",{subjectId}).catch(error=>{subjectDetailRequests.delete(subjectId);throw error});subjectDetailRequests.set(subjectId,request);return request}
-
-// Bangumi 周表放送日为 JST 语义（UTC+9）：默认 Tab 与后端徽章"今天"保持一致。
-const jstToday=()=>(new Date(Date.now()+9*3600e3).getUTCDay()+6)%7;
-export default function App(){
- const [view,setView]=useState<View>("today"),[weekday,setWeekday]=useState(jstToday()),[subjects,setSubjects]=useState<Subject[]>([]),[downloads,setDownloads]=useState<DownloadTask[]>([]),[feeds,setFeeds]=useState<RssFeed[]>([]),[rssItems,setRssItems]=useState<RssItem[]>([]),[selected,setSelected]=useState<Subject|null>(null),[collectionFilter,setCollectionFilter]=useState<Collection>("doing"),[rssUrl,setRssUrl]=useState(""),[online,setOnline]=useState(true),[profile,setProfile]=useState<BangumiProfile|null>(null),[syncStatus,setSyncStatus]=useState<SyncStatus|null>(null),[rssInterval,setRssInterval]=useState(15),[calendarBusy,setCalendarBusy]=useState(false),[calendarMessage,setCalendarMessage]=useState("");
- const calendarRequest=useRef(0);
- async function refreshCalendar(force=false){if(!isTauri()){setCalendarBusy(false);setCalendarMessage("浏览器预览不可用，请在桌面端运行 Mizuki");return}const request=++calendarRequest.current;setCalendarBusy(true);setCalendarMessage(calendarBusy?"正在重新请求最新数据…":"正在刷新今日番剧…");try{const data=await invoke<CalendarPayload>("get_calendar",{force});if(request!==calendarRequest.current)return;setSubjects(data.subjects);setOnline(!data.stale);setCalendarMessage(data.warning||`已更新 ${new Date(data.refreshedAt||Date.now()).toLocaleTimeString()}`)}catch(error){if(request!==calendarRequest.current)return;setOnline(false);setCalendarMessage(String(error))}finally{if(request===calendarRequest.current)setCalendarBusy(false)}}
- const refreshDownloads=useCallback(async()=>{try{setDownloads(await invoke<DownloadTask[]>("list_downloads"))}catch{/* browser preview */}},[]);
- const refreshRssData=useCallback(async()=>{try{const [nextFeeds,nextItems]=await Promise.all([invoke<RssFeed[]>("list_rss_feeds"),invoke<RssItem[]>("list_rss_items",{feedId:null,limit:500})]);setFeeds(nextFeeds);setRssItems(nextItems)}catch{/* browser preview */}},[]);
- async function addFeed(){if(!rssUrl.trim())return;try{await invoke<RssFeed>("add_rss_feed",{url:rssUrl.trim()});setRssUrl("");await refreshRssData()}catch(e){alert(String(e))}}
- async function updateCollection(subject:Subject,collection:Collection){setSubjects(items=>items.some(item=>item.id===subject.id)?items.map(i=>i.id===subject.id?{...i,collection}:i):[...items,{...subject,collection}]);setSelected(c=>c?.id===subject.id?{...c,collection}:c);try{await invoke("set_collection",{subjectId:subject.id,collection,subject:{...subject,collection}})}catch{/* 本地界面仍保留本次选择 */}}
- async function setProgress(subject:Subject,watched:number){const value=Math.max(0,watched),collection=subject.collection??"doing";setSubjects(items=>items.some(i=>i.id===subject.id)?items.map(i=>i.id===subject.id?{...i,watched:value,collection}:i):[...items,{...subject,watched:value,collection}]);setSelected(c=>c?.id===subject.id?{...c,watched:value,collection}:c);try{await invoke("set_watch_progress",{subjectId:subject.id,watched:value})}catch{/* 本地界面仍保留本次进度 */}}
- const subscribedIds=useMemo(()=>new Set(feeds.map(f=>f.subjectId).filter((id):id is number=>typeof id==="number")),[feeds]);
- async function subscribeSubject(subject:Subject){try{await invoke("subscribe_subject",{subjectId:subject.id,name:subject.name,nameCn:subject.nameCn});await Promise.all([refreshRssData(),refreshCalendar()])}catch(e){alert(`订阅失败：${String(e)}`)}}
- async function unsubscribeSubject(subject:Subject){if(!confirm(`取消订阅“${subject.nameCn||subject.name}”的新集自动下载？已添加的下载任务会保留。`))return;try{await invoke("unsubscribe_subject",{subjectId:subject.id});await Promise.all([refreshRssData(),refreshCalendar()])}catch(e){alert(String(e))}}
- async function refreshProfile(){try{setProfile(await invoke<BangumiProfile|null>("get_bangumi_profile"))}catch{setProfile(null)}}
- async function refreshSyncStatus(){if(!isTauri())return;try{setSyncStatus(await invoke<SyncStatus>("get_sync_status"))}catch{/* 浏览器预览无此命令 */}}
- useEffect(()=>{refreshCalendar();refreshDownloads();refreshProfile();refreshRssData();refreshSyncStatus();const syncTimer=window.setInterval(refreshSyncStatus,20000);if(!isTauri())return()=>window.clearInterval(syncTimer);let unlisten:(()=>void)|undefined,disposed=false;listen<number>("bangumi-imported",()=>{refreshCalendar()}).then(off=>{if(disposed)off();else unlisten=off});return()=>{disposed=true;unlisten?.();window.clearInterval(syncTimer)}},[]);
- useEffect(()=>{if(!isTauri())return;let cancelled=false;(async()=>{try{const settings=await invoke<AppSettings>("get_settings");if(!cancelled)setRssInterval(Math.max(5,settings.rssIntervalMinutes))}catch{/* 浏览器预览无此命令 */}})();return()=>{cancelled=true}},[]);
- useEffect(()=>{const timer=window.setInterval(async()=>{try{await invoke("refresh_all_rss_feeds")}catch{/* 保留成功刷新的订阅结果 */}await Promise.all([refreshRssData(),refreshDownloads()])},rssInterval*60*1000);return()=>window.clearInterval(timer)},[rssInterval]);
- const shownSubjects=useMemo(()=>subjects.filter(s=>s.collection===collectionFilter),[subjects,collectionFilter]);
- const todaySubjects=useMemo(()=>subjects.filter(s=>s.airWeekday===weekday),[subjects,weekday]);
- const trackedToday=useMemo(()=>todaySubjects.filter(s=>s.collection==="doing"||s.collection==="wish"),[todaySubjects]);
- const otherToday=useMemo(()=>todaySubjects.filter(s=>s.collection!=="doing"&&s.collection!=="wish"),[todaySubjects]);
- return <div className="window-root"><div className="drag-strip" data-tauri-drag-region/><WindowControls/><div className="app-shell"><aside className="sidebar"><div className="brand" data-tauri-drag-region><img src="/icon.png" data-tauri-drag-region/><span data-tauri-drag-region>Mizuki</span></div><nav>{nav.map(i=><button key={i.id} className={view===i.id?"active":""} onClick={()=>setView(i.id)}><span>{i.icon}</span>{i.label}</button>)}</nav><button className="profile-entry" onClick={()=>setView("settings")} title="Bangumi 与本地资料">{profile?.avatar?<img src={profile.avatar}/>:<span className="default-avatar">●</span>}<div><b>{profile?.nickname||profile?.username||"本地资料"}</b><small><i className={online?"online":"offline"}/>{profile?(syncStatus?.pending?`${syncStatus.pending} 条待同步`:"Bangumi 已连接"):online?"本地模式":"当前离线"}</small></div></button></aside><main>
- {view==="today"&&<><header><div><p className="eyebrow">WEEKLY CALENDAR</p><h1>今天看什么？</h1><p>按放送日发现新番，优先查看你的收藏。</p></div><button className="ghost" aria-busy={calendarBusy} onClick={()=>refreshCalendar(true)}>{calendarBusy?"↻ 重新刷新":"↻ 刷新"}</button></header>{calendarMessage&&<div className={`calendar-message${online?"":" warning"}`}>{calendarMessage}</div>}<div className="weekday-tabs">{weekdays.map((d,i)=><button className={weekday===i?"active":""} onClick={()=>setWeekday(i)} key={d}>{d}<small>{subjects.filter(s=>s.airWeekday===i).length}</small></button>)}</div>{calendarBusy&&subjects.length===0?<SkeletonGrid count={8}/>:<>{trackedToday.length>0&&<TodaySection title="我的追番" subtitle="当天放送的在看与想看" count={trackedToday.length} featured><SubjectGrid subjects={trackedToday} onSelect={setSelected}/></TodaySection>}{otherToday.length>0&&<TodaySection title={trackedToday.length?"今日全部":"今日番剧"} subtitle={trackedToday.length?"其他当天放送番剧":"当天放送的全部番剧"} count={otherToday.length}><SubjectGrid subjects={otherToday} onSelect={setSelected}/></TodaySection>}{todaySubjects.length===0&&<SubjectGrid subjects={[]} onSelect={setSelected}/>}</>}</>}
- {view==="search"&&<SearchPage onSelect={setSelected}/>}
- {view==="library"&&<><header><div><p className="eyebrow">MY COLLECTION</p><h1>我的追番</h1><p>收藏与章节进度保存在本机，无需登录账号。</p></div><span className="tag">本地管理</span></header><div className="filter-pills">{(Object.keys(collectionLabels) as Collection[]).map(k=><button key={k} className={collectionFilter===k?"active":""} onClick={()=>setCollectionFilter(k)}>{collectionLabels[k]}<span>{subjects.filter(s=>s.collection===k).length}</span></button>)}</div>{calendarBusy&&subjects.length===0?<SkeletonGrid count={8}/>:<SubjectGrid subjects={shownSubjects} onSelect={setSelected}/>}</>}
- {view==="rss"&&<RssPage feeds={feeds} items={rssItems} rssUrl={rssUrl} setRssUrl={setRssUrl} addFeed={addFeed} reload={refreshRssData} refreshDownloads={refreshDownloads} onOpenDownloads={()=>setView("downloads")}/>} {view==="downloads"&&<DownloadsPage tasks={downloads} refresh={refreshDownloads}/>} {view==="settings"&&<SettingsPage profile={profile} onProfile={setProfile} onSynced={refreshCalendar} syncStatus={syncStatus} onSyncStatus={setSyncStatus} onSettingsSaved={settings=>setRssInterval(Math.max(5,settings.rssIntervalMinutes))}/>} 
- </main>{selected&&<DetailDrawer subject={selected} close={()=>setSelected(null)} updateCollection={updateCollection} setProgress={setProgress} subscribed={subscribedIds.has(selected.id)} subscribe={subscribeSubject} unsubscribe={unsubscribeSubject}/>}</div></div>
+export default function App() {
+  const [view, setView] = useState<View>("today"),
+    [weekday, setWeekday] = useState(jstToday()),
+    [subjects, setSubjects] = useState<Subject[]>([]),
+    [downloads, setDownloads] = useState<DownloadTask[]>([]),
+    [feeds, setFeeds] = useState<RssFeed[]>([]),
+    [rssItems, setRssItems] = useState<RssItem[]>([]),
+    [selected, setSelected] = useState<Subject | null>(null),
+    [collectionFilter, setCollectionFilter] = useState<Collection>("doing"),
+    [rssUrl, setRssUrl] = useState(""),
+    [online, setOnline] = useState(true),
+    [profile, setProfile] = useState<BangumiProfile | null>(null),
+    [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null),
+    [rssInterval, setRssInterval] = useState(15),
+    [calendarBusy, setCalendarBusy] = useState(false),
+    [calendarMessage, setCalendarMessage] = useState("");
+  const calendarRequest = useRef(0);
+  async function refreshCalendar(force = false) {
+    if (!isTauri()) {
+      setCalendarBusy(false);
+      setCalendarMessage("浏览器预览不可用，请在桌面端运行 Mizuki");
+      return;
+    }
+    const request = ++calendarRequest.current;
+    setCalendarBusy(true);
+    setCalendarMessage(calendarBusy ? "正在重新请求最新数据…" : "正在刷新今日番剧…");
+    try {
+      const data = await invoke<CalendarPayload>("get_calendar", { force });
+      if (request !== calendarRequest.current) return;
+      setSubjects(data.subjects);
+      setOnline(!data.stale);
+      setCalendarMessage(
+        data.warning || `已更新 ${new Date(data.refreshedAt || Date.now()).toLocaleTimeString()}`,
+      );
+    } catch (error) {
+      if (request !== calendarRequest.current) return;
+      setOnline(false);
+      setCalendarMessage(String(error));
+    } finally {
+      if (request === calendarRequest.current) setCalendarBusy(false);
+    }
+  }
+  const refreshDownloads = useCallback(async () => {
+    try {
+      setDownloads(await invoke<DownloadTask[]>("list_downloads"));
+    } catch {
+      /* browser preview */
+    }
+  }, []);
+  const refreshRssData = useCallback(async () => {
+    try {
+      const [nextFeeds, nextItems] = await Promise.all([
+        invoke<RssFeed[]>("list_rss_feeds"),
+        invoke<RssItem[]>("list_rss_items", { feedId: null, limit: 500 }),
+      ]);
+      setFeeds(nextFeeds);
+      setRssItems(nextItems);
+    } catch {
+      /* browser preview */
+    }
+  }, []);
+  async function addFeed() {
+    if (!rssUrl.trim()) return;
+    try {
+      await invoke<RssFeed>("add_rss_feed", { url: rssUrl.trim() });
+      setRssUrl("");
+      await refreshRssData();
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+  async function updateCollection(subject: Subject, collection: Collection) {
+    setSubjects((items) =>
+      items.some((item) => item.id === subject.id)
+        ? items.map((i) => (i.id === subject.id ? { ...i, collection } : i))
+        : [...items, { ...subject, collection }],
+    );
+    setSelected((c) => (c?.id === subject.id ? { ...c, collection } : c));
+    try {
+      await invoke("set_collection", {
+        subjectId: subject.id,
+        collection,
+        subject: { ...subject, collection },
+      });
+    } catch {
+      /* 本地界面仍保留本次选择 */
+    }
+  }
+  async function setProgress(subject: Subject, watched: number) {
+    const value = Math.max(0, watched),
+      collection = subject.collection ?? "doing";
+    setSubjects((items) =>
+      items.some((i) => i.id === subject.id)
+        ? items.map((i) => (i.id === subject.id ? { ...i, watched: value, collection } : i))
+        : [...items, { ...subject, watched: value, collection }],
+    );
+    setSelected((c) => (c?.id === subject.id ? { ...c, watched: value, collection } : c));
+    try {
+      await invoke("set_watch_progress", { subjectId: subject.id, watched: value });
+    } catch {
+      /* 本地界面仍保留本次进度 */
+    }
+  }
+  const subscribedIds = useMemo(
+    () => new Set(feeds.map((f) => f.subjectId).filter((id): id is number => typeof id === "number")),
+    [feeds],
+  );
+  async function subscribeSubject(subject: Subject) {
+    try {
+      await invoke("subscribe_subject", {
+        subjectId: subject.id,
+        name: subject.name,
+        nameCn: subject.nameCn,
+      });
+      await Promise.all([refreshRssData(), refreshCalendar()]);
+    } catch (e) {
+      alert(`订阅失败：${String(e)}`);
+    }
+  }
+  async function unsubscribeSubject(subject: Subject) {
+    if (!confirm(`取消订阅“${subject.nameCn || subject.name}”的新集自动下载？已添加的下载任务会保留。`))
+      return;
+    try {
+      await invoke("unsubscribe_subject", { subjectId: subject.id });
+      await Promise.all([refreshRssData(), refreshCalendar()]);
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+  async function refreshProfile() {
+    try {
+      setProfile(await invoke<BangumiProfile | null>("get_bangumi_profile"));
+    } catch {
+      setProfile(null);
+    }
+  }
+  async function refreshSyncStatus() {
+    if (!isTauri()) return;
+    try {
+      setSyncStatus(await invoke<SyncStatus>("get_sync_status"));
+    } catch {
+      /* 浏览器预览无此命令 */
+    }
+  }
+  useEffect(() => {
+    refreshCalendar();
+    refreshDownloads();
+    refreshProfile();
+    refreshRssData();
+    refreshSyncStatus();
+    const syncTimer = window.setInterval(refreshSyncStatus, 20000);
+    if (!isTauri()) return () => window.clearInterval(syncTimer);
+    let unlisten: (() => void) | undefined,
+      disposed = false;
+    listen<number>("bangumi-imported", () => {
+      refreshCalendar();
+    }).then((off) => {
+      if (disposed) off();
+      else unlisten = off;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+      window.clearInterval(syncTimer);
+    };
+  }, []);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const settings = await invoke<AppSettings>("get_settings");
+        if (!cancelled) setRssInterval(Math.max(5, settings.rssIntervalMinutes));
+      } catch {
+        /* 浏览器预览无此命令 */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  useEffect(() => {
+    const timer = window.setInterval(
+      async () => {
+        try {
+          await invoke("refresh_all_rss_feeds");
+        } catch {
+          /* 保留成功刷新的订阅结果 */
+        }
+        await Promise.all([refreshRssData(), refreshDownloads()]);
+      },
+      rssInterval * 60 * 1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [rssInterval, refreshRssData, refreshDownloads]);
+  const shownSubjects = useMemo(
+    () => subjects.filter((s) => s.collection === collectionFilter),
+    [subjects, collectionFilter],
+  );
+  const todaySubjects = useMemo(() => subjects.filter((s) => s.airWeekday === weekday), [subjects, weekday]);
+  const trackedToday = useMemo(
+    () => todaySubjects.filter((s) => s.collection === "doing" || s.collection === "wish"),
+    [todaySubjects],
+  );
+  const otherToday = useMemo(
+    () => todaySubjects.filter((s) => s.collection !== "doing" && s.collection !== "wish"),
+    [todaySubjects],
+  );
+  return (
+    <div className="window-root">
+      <div className="drag-strip" data-tauri-drag-region />
+      <WindowControls />
+      <div className="app-shell">
+        <aside className="sidebar">
+          <div className="brand" data-tauri-drag-region>
+            <img src="/icon.png" data-tauri-drag-region />
+            <span data-tauri-drag-region>Mizuki</span>
+          </div>
+          <nav>
+            {nav.map((i) => (
+              <button key={i.id} className={view === i.id ? "active" : ""} onClick={() => setView(i.id)}>
+                <span>{i.icon}</span>
+                {i.label}
+              </button>
+            ))}
+          </nav>
+          <button className="profile-entry" onClick={() => setView("settings")} title="Bangumi 与本地资料">
+            {profile?.avatar ? <img src={profile.avatar} /> : <span className="default-avatar">●</span>}
+            <div>
+              <b>{profile?.nickname || profile?.username || "本地资料"}</b>
+              <small>
+                <i className={online ? "online" : "offline"} />
+                {profile
+                  ? syncStatus?.pending
+                    ? `${syncStatus.pending} 条待同步`
+                    : "Bangumi 已连接"
+                  : online
+                    ? "本地模式"
+                    : "当前离线"}
+              </small>
+            </div>
+          </button>
+        </aside>
+        <main>
+          {view === "today" && (
+            <>
+              <header>
+                <div>
+                  <p className="eyebrow">WEEKLY CALENDAR</p>
+                  <h1>今天看什么？</h1>
+                  <p>按放送日发现新番，优先查看你的收藏。</p>
+                </div>
+                <button className="ghost" aria-busy={calendarBusy} onClick={() => refreshCalendar(true)}>
+                  {calendarBusy ? "↻ 重新刷新" : "↻ 刷新"}
+                </button>
+              </header>
+              {calendarMessage && (
+                <div className={`calendar-message${online ? "" : " warning"}`}>{calendarMessage}</div>
+              )}
+              <div className="weekday-tabs">
+                {weekdays.map((d, i) => (
+                  <button className={weekday === i ? "active" : ""} onClick={() => setWeekday(i)} key={d}>
+                    {d}
+                    <small>{subjects.filter((s) => s.airWeekday === i).length}</small>
+                  </button>
+                ))}
+              </div>
+              {calendarBusy && subjects.length === 0 ? (
+                <SkeletonGrid count={8} />
+              ) : (
+                <>
+                  {trackedToday.length > 0 && (
+                    <TodaySection
+                      title="我的追番"
+                      subtitle="当天放送的在看与想看"
+                      count={trackedToday.length}
+                      featured
+                    >
+                      <SubjectGrid subjects={trackedToday} onSelect={setSelected} />
+                    </TodaySection>
+                  )}
+                  {otherToday.length > 0 && (
+                    <TodaySection
+                      title={trackedToday.length ? "今日全部" : "今日番剧"}
+                      subtitle={trackedToday.length ? "其他当天放送番剧" : "当天放送的全部番剧"}
+                      count={otherToday.length}
+                    >
+                      <SubjectGrid subjects={otherToday} onSelect={setSelected} />
+                    </TodaySection>
+                  )}
+                  {todaySubjects.length === 0 && <SubjectGrid subjects={[]} onSelect={setSelected} />}
+                </>
+              )}
+            </>
+          )}
+          {view === "search" && <SearchPage onSelect={setSelected} />}
+          {view === "library" && (
+            <>
+              <header>
+                <div>
+                  <p className="eyebrow">MY COLLECTION</p>
+                  <h1>我的追番</h1>
+                  <p>收藏与章节进度保存在本机，无需登录账号。</p>
+                </div>
+                <span className="tag">本地管理</span>
+              </header>
+              <div className="filter-pills">
+                {(Object.keys(collectionLabels) as Collection[]).map((k) => (
+                  <button
+                    key={k}
+                    className={collectionFilter === k ? "active" : ""}
+                    onClick={() => setCollectionFilter(k)}
+                  >
+                    {collectionLabels[k]}
+                    <span>{subjects.filter((s) => s.collection === k).length}</span>
+                  </button>
+                ))}
+              </div>
+              {calendarBusy && subjects.length === 0 ? (
+                <SkeletonGrid count={8} />
+              ) : (
+                <SubjectGrid subjects={shownSubjects} onSelect={setSelected} />
+              )}
+            </>
+          )}
+          {view === "rss" && (
+            <RssPage
+              feeds={feeds}
+              items={rssItems}
+              rssUrl={rssUrl}
+              setRssUrl={setRssUrl}
+              addFeed={addFeed}
+              reload={refreshRssData}
+              refreshDownloads={refreshDownloads}
+              onOpenDownloads={() => setView("downloads")}
+            />
+          )}
+          {view === "downloads" && <DownloadsPage tasks={downloads} refresh={refreshDownloads} />}
+          {view === "settings" && (
+            <SettingsPage
+              profile={profile}
+              onProfile={setProfile}
+              onSynced={() => refreshCalendar()}
+              syncStatus={syncStatus}
+              onSyncStatus={setSyncStatus}
+              onSettingsSaved={(settings) => setRssInterval(Math.max(5, settings.rssIntervalMinutes))}
+            />
+          )}
+        </main>
+        {selected && (
+          <DetailDrawer
+            subject={selected}
+            close={() => setSelected(null)}
+            updateCollection={updateCollection}
+            setProgress={setProgress}
+            subscribed={subscribedIds.has(selected.id)}
+            subscribe={subscribeSubject}
+            unsubscribe={unsubscribeSubject}
+          />
+        )}
+      </div>
+    </div>
+  );
 }
-
-function WindowControls(){
- const [theme,setTheme]=useState<Theme>(()=>localStorage.getItem("mizuki-theme")==="light"?"light":"dark");
- useEffect(()=>{document.documentElement.dataset.theme=theme;document.documentElement.style.colorScheme=theme;localStorage.setItem("mizuki-theme",theme)},[theme]);
- if(!isTauri())return null;
- const window=getCurrentWindow();
- return <div className="floating-window-controls">
-  <button className="theme-toggle" aria-label="切换深色或浅色模式" title={theme==="dark"?"切换到浅色模式":"切换到深色模式"} onClick={()=>setTheme(value=>value==="dark"?"light":"dark")}>{theme==="dark"?"☀":"☾"}</button>
-  <button aria-label="最小化" title="最小化" onClick={()=>window.minimize()}><i className="minimize-icon"/></button>
-  <button aria-label="最大化或还原" title="最大化或还原" onClick={()=>window.toggleMaximize()}><i className="maximize-icon"/></button>
-  <button className="close-window" aria-label="关闭" title="关闭到托盘" onClick={()=>window.close()}><i className="close-icon"/></button>
- </div>
-}
-
-function TodaySection({title,subtitle,count,featured=false,children}:{title:string;subtitle:string;count:number;featured?:boolean;children:ReactNode}){
- return <section className={`today-section${featured?" featured":""}`}><div className="today-section-title"><div><h2>{title}</h2><p>{subtitle}</p></div><span>{count}</span></div>{children}</section>
-}
-
-function SearchPage({onSelect}:{onSelect:(subject:Subject)=>void}){
- const [query,setQuery]=useState(""),[results,setResults]=useState<Subject[]>([]),[busy,setBusy]=useState(false),[message,setMessage]=useState("输入中文、日文或罗马字搜索番剧");
- useEffect(()=>{const keyword=query.trim();if(keyword.length<2){setResults([]);setBusy(false);setMessage("输入至少 2 个字符开始搜索");return}if(!isTauri()){setResults([]);setBusy(false);setMessage("搜索需要在 Mizuki 桌面端使用");return}let active=true;setBusy(true);const timer=window.setTimeout(async()=>{try{const data=await invoke<SearchPayload>("search_anime",{keyword,limit:24});if(!active)return;setResults(data.subjects);setMessage(data.warning||`找到 ${data.subjects.length} 部番剧`)}catch(error){if(active){setResults([]);setMessage(String(error))}}finally{if(active)setBusy(false)}},350);return()=>{active=false;window.clearTimeout(timer)}},[query]);
- return <><header><div><p className="eyebrow">BANGUMI SEARCH</p><h1>搜索番剧</h1><p>搜索 Bangumi 动画条目，并直接加入你的追番收藏。</p></div></header><div className="anime-search"><span>⌕</span><input autoFocus value={query} onChange={event=>setQuery(event.target.value)} placeholder="输入番剧名称，例如：葬送的芙莉莲"/><small>{busy?"搜索中…":message}</small></div>{busy?<SkeletonGrid count={4}/>:results.length?<SubjectGrid subjects={results} onSelect={onSelect}/>:<div className="empty compact"><span>⌕</span><h3>暂无搜索结果</h3><p>{message}</p></div>}</>
-}
-
-function SubjectGrid({subjects,onSelect}:{subjects:Subject[];onSelect:(s:Subject)=>void}){if(!subjects.length)return <div className="empty"><span>☾</span><h3>这里暂时没有番剧</h3><p>刷新数据或切换其他分类看看。</p></div>;return <section className="subject-grid">{subjects.map(s=><SubjectCard key={s.id} subject={s} onSelect={onSelect}/>)}</section>}
-function SkeletonGrid({count=6}:{count?:number}){return <section className="subject-grid" aria-busy="true">{Array.from({length:count},(_,i)=><div className="skeleton-card" key={i}><div className="skeleton cover-sk"/><div className="card-content"><div className="skeleton line-sk"/><div className="skeleton line-sk short"/></div></div>)}</section>}
-function SubjectCard({subject:s,onSelect}:{subject:Subject;onSelect:(s:Subject)=>void}){
- const [resolved,setResolved]=useState({episodes:s.episodes,score:s.score,rank:s.rank,image:s.image});
- useEffect(()=>{setResolved({episodes:s.episodes,score:s.score,rank:s.rank,image:s.image});if(s.score>0&&s.episodes>0)return;let active=true;loadSubjectDetail(s.id).then(value=>{if(active)setResolved(current=>({episodes:value.total_episodes??value.eps??current.episodes,score:value.rating?.score??current.score,rank:value.rating?.rank??current.rank,image:value.images?.large??value.images?.common??current.image}))}).catch(()=>{});return()=>{active=false}},[s.id,s.episodes,s.score,s.rank,s.image]);
- const hydrated={...s,...resolved};
- return <article className="subject-card" onClick={()=>onSelect(hydrated)}><div className="cover">{resolved.image?<img src={resolved.image} alt=""/>:<span>{(s.nameCn||s.name).slice(0,2)}</span>}<b className={`state ${s.updateState}`}>{s.updateState==="published"?"有更新":s.updateState==="downloading"?"下载中":s.updateState==="completed"?"已下载":""}</b></div><div className="card-content"><h3>{s.nameCn||s.name}</h3><p>{s.name}</p><div className="meta"><strong>★ {resolved.score>0?resolved.score.toFixed(1):"—"}</strong>{resolved.rank&&<span>#{resolved.rank}</span>}<span>{s.watched}/{resolved.episodes||"?"} 话</span></div></div></article>
-}
-function DetailDrawer({subject,close,updateCollection,setProgress,subscribed,subscribe,unsubscribe}:{subject:Subject;close:()=>void;updateCollection:(s:Subject,c:Collection)=>void;setProgress:(s:Subject,w:number)=>void;subscribed:boolean;subscribe:(s:Subject)=>void;unsubscribe:(s:Subject)=>void}){
- const [detail,setDetail]=useState<SubjectDetail|null>(null),[comments,setComments]=useState<BangumiComment[]>([]),[loading,setLoading]=useState(true),[error,setError]=useState(""),[commentError,setCommentError]=useState("");
- useEffect(()=>{let active=true;setLoading(true);setError("");setCommentError("");Promise.allSettled([loadSubjectDetail(subject.id),invoke<CommentPage>("get_comments",{subjectId:subject.id,offset:0})]).then(results=>{if(!active)return;const [detailResult,commentResult]=results;if(detailResult.status==="fulfilled")setDetail(detailResult.value);else setError(String(detailResult.reason));if(commentResult.status==="fulfilled")setComments(commentResult.value.data||[]);else setCommentError(String(commentResult.reason));setLoading(false)});return()=>{active=false}},[subject.id]);
- const episodes=detail?.total_episodes||detail?.eps||subject.episodes;
- const summary=detail?.summary?.trim()||subject.summary?.trim();
- const score=detail?.rating?.score??subject.score;
- const rank=detail?.rating?.rank??subject.rank;
- const cover=detail?.images?.large||detail?.images?.common||subject.image;
- return <div className="drawer-backdrop" onMouseDown={close}><aside className="detail-drawer" onMouseDown={e=>e.stopPropagation()}><button className="drawer-close" onClick={close} aria-label="返回番剧列表" title="返回"><span>←</span>返回</button><div className="detail-hero"><div className="detail-cover">{cover?<img src={cover}/>:subject.nameCn.slice(0,2)}</div><div><p className="eyebrow">BANGUMI #{subject.id}</p><h2>{subject.nameCn||subject.name}</h2><p>{subject.name}</p><div className="score"><strong>{score||"—"}</strong><span>Bangumi 评分<br/>排名 #{rank||"—"}</span></div><button className="ghost bangumi-link" onClick={()=>openUrl(`https://bgm.tv/subject/${subject.id}`)}>在 Bangumi 打开 ↗</button>{subscribed?<button className="ghost bangumi-link" title="取消后已有下载任务会保留" onClick={()=>unsubscribe(subject)}>✓ 已订阅新集 · 点击取消</button>:<button className="ghost bangumi-link" title="新集发布时按规则自动下载" onClick={()=>subscribe(subject)}>订阅新集 · 自动下载</button>}</div></div><div className="collection-select">{(Object.keys(collectionLabels) as Collection[]).map(k=><button key={k} className={subject.collection===k?"active":""} onClick={()=>updateCollection(subject,k)}>{collectionLabels[k]}</button>)}</div><section><h3>简介</h3>{loading&&!summary?<p className="summary muted">正在读取条目详情…</p>:<p className="summary">{summary||"Bangumi 暂未收录简介"}</p>}{error&&<small className="detail-error">{error}</small>}</section><section><div className="section-title"><h3>观看进度</h3><span>{subject.watched}/{episodes||"?"}</span></div><div className="progress"><i style={{width:`${episodes?Math.min(100,subject.watched/episodes*100):0}%`}}/></div><div className="progress-controls"><button aria-label="减少一集" disabled={subject.watched<=0} onClick={()=>setProgress(subject,subject.watched-1)}>−</button><input aria-label="观看集数" type="number" min={0} max={episodes||undefined} value={subject.watched} onChange={e=>{const value=parseInt(e.target.value,10);if(!Number.isNaN(value))setProgress(subject,value)}}/><button aria-label="看完一集" onClick={()=>setProgress(subject,subject.watched+1)}>＋1</button>{episodes>0&&subject.watched<episodes&&<button className="mark-finished" onClick={()=>setProgress(subject,episodes)}>全部看完</button>}</div><p className="episode-total">共 {episodes||"未知"} 集 · 改动会同步到 Bangumi</p></section><section><div className="section-title"><h3>热门短评</h3><span>{comments.length?`显示 ${comments.length} 条`:"Bangumi 社区"}</span></div>{loading&&!comments.length?<div className="comment"><p>正在读取短评…</p></div>:comments.length?<div className="comment-list">{comments.slice(0,6).map(item=><article className="comment" key={item.id}><div className="comment-user">{item.user?.avatar?.small||item.user?.avatar?.medium?<img src={item.user.avatar.small||item.user.avatar.medium}/>:<span>●</span>}<b>{item.user?.nickname||item.user?.username||"Bangumi 用户"}</b>{item.rate?<em>★ {item.rate}</em>:null}{item.spoiler&&<i>剧透</i>}</div><p>{item.spoiler?"该短评包含剧透，请前往 Bangumi 查看。":item.comment||"（无文字短评）"}</p></article>)}</div>:commentError?<div className="comment"><b>短评加载失败</b><p>可用上方“在 Bangumi 打开”前往查看原文。</p></div>:<div className="comment"><b>暂无短评</b><p>这个条目目前没有可显示的公开短评。</p></div>}</section></aside></div>}
-function releaseAnimeName(title:string){const clean=title.trim().replace(/^(?:\s*\[[^\]]+\]\s*)+/,"");const indexes=[clean.search(/\s(?:-|–|—)\s*(?:EP?|E)?\d{1,4}(?:v\d+)?(?:\s|\[|$)/i),clean.search(/\s第\s*\d+(?:\.\d+)?\s*[话話集]/),clean.search(/\s\[(?:\d{3,4}p|web|baha|简|繁|chs|cht|jpn|hevc|avc)/i)].filter(i=>i>0);return(indexes.length?clean.slice(0,Math.min(...indexes)):clean).replace(/[\s._-]+$/g,"").trim()||"未识别番剧"}
-const parseKeywords=(value:string)=>value.split(/[,，、\s]+/).filter(Boolean);
-function RssPage({feeds,items,rssUrl,setRssUrl,addFeed,reload,refreshDownloads,onOpenDownloads}:{feeds:RssFeed[];items:RssItem[];rssUrl:string;setRssUrl:(v:string)=>void;addFeed:()=>void;reload:()=>Promise<void>;refreshDownloads:()=>Promise<void>;onOpenDownloads:()=>void}){
- const [busy,setBusy]=useState(""),[pendingItems,setPendingItems]=useState<Set<string>>(new Set()),[message,setMessage]=useState(""),[selectedItems,setSelectedItems]=useState<Set<string>>(new Set()),[filter,setFilter]=useState<"all"|"pending"|"active"|"completed">("all"),[resourceQuery,setResourceQuery]=useState(""),[ruleDraft,setRuleDraft]=useState<{feedId:string;includes:string;excludes:string;resolution:string;subtitleGroup:string;autoDownload:boolean}|null>(null);
- const visibleItems=useMemo(()=>items.filter(item=>{const matches=!resourceQuery.trim()||item.title.toLocaleLowerCase().includes(resourceQuery.trim().toLocaleLowerCase());if(!matches)return false;const stalled=!!item.download&&!item.download.active&&["queued","downloading","paused"].includes(item.download.state);if(filter==="pending")return !item.download||item.download.state==="failed"||stalled;if(filter==="active")return !!item.download?.active&&["queued","downloading","paused"].includes(item.download.state);if(filter==="completed")return item.download?.state==="completed";return true}),[items,filter,resourceQuery]);
- const selectableVisibleGuids=useMemo(()=>new Set(visibleItems.filter(item=>!item.download||item.download.state==="failed"||(!item.download.active&&["queued","downloading","paused"].includes(item.download.state))).map(item=>item.guid)),[visibleItems]);
- const selectedVisibleCount=useMemo(()=>[...selectedItems].filter(guid=>selectableVisibleGuids.has(guid)).length,[selectedItems,selectableVisibleGuids]);
- const groups=useMemo(()=>{const result=new Map<string,RssItem[]>();visibleItems.forEach(item=>{const name=releaseAnimeName(item.title);result.set(name,[...(result.get(name)||[]),item])});return [...result].sort((a,b)=>a[0].localeCompare(b[0],"zh-CN"))},[visibleItems]);
- useEffect(()=>{setSelectedItems(current=>{const next=new Set([...current].filter(guid=>selectableVisibleGuids.has(guid)));return next.size===current.size?current:next})},[selectableVisibleGuids]);
- useEffect(()=>{const timer=window.setInterval(async()=>{await refreshDownloads();await reload()},3000);return()=>window.clearInterval(timer)},[reload,refreshDownloads]);
- async function run(label:string,action:()=>Promise<unknown>){setBusy(label);setMessage("");try{await action();await reload()}catch(error){setMessage(String(error))}finally{setBusy("")}}
- async function refreshAll(){setBusy("all");setMessage("");try{const count=await invoke<number>("refresh_all_rss_feeds");setMessage(`刷新完成，发现 ${count} 条新资源`);await reload();await refreshDownloads()}catch(error){setMessage(String(error));await reload()}finally{setBusy("")}}
- async function downloadOne(item:RssItem){setPendingItems(current=>new Set(current).add(item.guid));setMessage("");try{await invoke("download_rss_item",{guid:item.guid});await Promise.all([refreshDownloads(),reload()])}catch(error){setMessage(String(error));await reload()}finally{setPendingItems(current=>{const next=new Set(current);next.delete(item.guid);return next})}}
- function toggle(guid:string){setSelectedItems(current=>{const next=new Set(current);next.has(guid)?next.delete(guid):next.add(guid);return next})}
- async function batchDownload(){const guids=[...selectedItems].filter(guid=>selectableVisibleGuids.has(guid));if(!guids.length)return;setBusy("selected");setMessage("");try{const result=await invoke<BatchDownloadResult>("download_rss_items",{guids});setMessage(`新增 ${result.added} 个任务${result.reused?`，复用 ${result.reused} 个已有任务`:""}${result.failed?`，失败 ${result.failed} 个：${result.errors.join("；")}`:""}`);setSelectedItems(new Set());await refreshDownloads();await reload()}catch(error){setMessage(String(error));await reload()}finally{setBusy("")}}
- function selectGroup(group:RssItem[]){setSelectedItems(current=>{const next=new Set(current);group.filter(item=>!item.download||item.download.state==="failed"||(!item.download.active&&["queued","downloading","paused"].includes(item.download.state))).forEach(item=>next.add(item.guid));return next})}
- function openRules(feed:RssFeed){setRuleDraft({feedId:feed.id,includes:feed.rule.includes.join("，"),excludes:feed.rule.excludes.join("，"),resolution:feed.rule.resolution??"",subtitleGroup:feed.rule.subtitleGroup??"",autoDownload:feed.rule.autoDownload})}
- async function saveRules(){if(!ruleDraft)return;const draft=ruleDraft;setBusy("rules");setMessage("");try{await invoke("set_rss_feed_rules",{id:draft.feedId,rule:{includes:parseKeywords(draft.includes),excludes:parseKeywords(draft.excludes),resolution:draft.resolution.trim()||null,subtitleGroup:draft.subtitleGroup.trim()||null,autoDownload:draft.autoDownload}});setRuleDraft(null);await reload()}catch(error){setMessage(String(error))}finally{setBusy("")}}
- const stateLabel=(item:RssItem)=>item.download?.state==="completed"?"已下载":item.download&&!item.download.active&&["queued","downloading","paused"].includes(item.download.state)?"连接已中断":item.download?.state==="downloading"?`下载中 ${Math.round(item.download.progress*100)}%`:item.download?.state==="paused"?"已暂停":item.download?.state==="queued"?"下载中":item.download?.state==="failed"?"下载失败":"待下载";
- const actionLabel=(item:RssItem)=>item.download?.state==="completed"?"已下载":item.download?.active&&["queued","downloading"].includes(item.download.state)?"下载中":item.download&&!item.download.active&&["queued","downloading","paused"].includes(item.download.state)?"重新连接":item.download?.state==="failed"?"重试下载":"下载";
- return <><header><div><p className="eyebrow">MIKAN RSS + DOWNLOADS</p><h1>订阅资源</h1><p>按番剧整理新资源，手动选择并跟踪真实下载状态。</p></div><div className="header-actions"><button className="ghost" onClick={onOpenDownloads}>下载管理 ↗</button><button className="ghost" disabled={!!busy} onClick={refreshAll}>{busy==="all"?"刷新中…":"↻ 全部刷新"}</button></div></header><div className="rss-add"><div><label>添加 Mikan RSS 地址</label><div><input value={rssUrl} onChange={e=>setRssUrl(e.target.value)} placeholder="https://mikanani.me/RSS/..." onKeyDown={event=>event.key==="Enter"&&addFeed()}/><button className="primary" onClick={addFeed}>验证并添加</button></div><small>每 15 分钟只刷新资源列表，不会自动下载。</small></div></div>{message&&<div className="manager-message">{message}</div>}<div className="section-title manager-heading"><h2>订阅源 <small>{feeds.length}</small></h2></div><div className="feed-list">{feeds.map(f=><div className="feed-block" key={f.id}><div className={`feed-row${f.enabled?"":" disabled"}`}><span className="feed-icon">◒</span><div><h3>{f.title}</h3><p>{f.url}</p><small>{f.lastCheckedAt?new Date(f.lastCheckedAt).toLocaleString():"尚未刷新"}{f.subjectId?" · 追番订阅":""}{f.rule.autoDownload&&" · 自动下载已开启"}{f.rule.includes.length||f.rule.excludes.length||f.rule.resolution||f.rule.subtitleGroup?" · 已配置规则":""}</small></div><div className="feed-actions"><button disabled={!!busy} onClick={()=>openRules(f)}>{ruleDraft?.feedId===f.id?"收起规则":"规则"}</button><button disabled={!!busy} onClick={()=>run(`refresh-${f.id}`,()=>invoke("refresh_rss_feed",{id:f.id}))}>{busy===`refresh-${f.id}`?"刷新中…":"刷新"}</button><button onClick={()=>run(`enable-${f.id}`,()=>invoke("set_rss_feed_enabled",{id:f.id,enabled:!f.enabled}))}>{f.enabled?"停用":"启用"}</button><button className="danger" onClick={()=>confirm(`删除订阅“${f.title}”？`)&&run(`delete-${f.id}`,()=>invoke("delete_rss_feed",{id:f.id}))}>删除</button></div></div>{ruleDraft?.feedId===f.id&&<div className="rule-editor"><div className="rule-fields"><label>必须包含（逗号分隔）<input value={ruleDraft.includes} onChange={e=>setRuleDraft({...ruleDraft,includes:e.target.value})} placeholder="简中，简体"/></label><label>必须排除（逗号分隔）<input value={ruleDraft.excludes} onChange={e=>setRuleDraft({...ruleDraft,excludes:e.target.value})} placeholder="720p，预告"/></label><label>分辨率<input value={ruleDraft.resolution} onChange={e=>setRuleDraft({...ruleDraft,resolution:e.target.value})} placeholder="1080p"/></label><label>字幕组<input value={ruleDraft.subtitleGroup} onChange={e=>setRuleDraft({...ruleDraft,subtitleGroup:e.target.value})} placeholder="喵萌奶茶屋"/></label></div><div className="rule-footer"><label className="rule-toggle"><input type="checkbox" checked={ruleDraft.autoDownload} onChange={e=>setRuleDraft({...ruleDraft,autoDownload:e.target.checked})}/>自动下载匹配的新资源</label><div><button className="ghost" onClick={()=>setRuleDraft(null)}>取消</button><button className="primary" disabled={busy==="rules"} onClick={saveRules}>{busy==="rules"?"保存中…":"保存规则"}</button></div></div><small>规则在刷新发现新资源时生效：标记“符合规则”并按需自动下载；条件留空表示不限制。</small></div>}</div>)}</div><div className="rss-tools"><input value={resourceQuery} onChange={event=>setResourceQuery(event.target.value)} placeholder="筛选番剧或资源名称"/><div>{(["all","pending","active","completed"] as const).map(value=><button className={filter===value?"active":""} onClick={()=>setFilter(value)} key={value}>{value==="all"?"全部":value==="pending"?"待下载":value==="active"?"进行中":"已完成"}</button>)}</div></div><div className="section-title manager-heading rss-resource-heading"><h2>按番剧分类 <small>{groups.length} 部 · {visibleItems.length}/{items.length} 个资源</small></h2><button className="primary" disabled={!selectedVisibleCount||!!busy} onClick={batchDownload}>{busy==="selected"?"正在添加…":`下载所选 (${selectedVisibleCount})`}</button></div><div className="rss-groups">{groups.map(([name,group])=><details className="rss-group" key={name} open><summary><span>{name}</span><small>{group.length} 个资源</small></summary><div className="rss-group-actions"><button onClick={()=>selectGroup(group)}>选择待下载</button></div><div className="rss-item-list">{group.map(item=>{const retryable=!item.download||item.download.state==="failed"||(!item.download.active&&["queued","downloading","paused"].includes(item.download.state));const blocked=!retryable;const itemBusy=pendingItems.has(item.guid);return <article className={item.download?`has-task ${item.download.state}`:""} key={item.guid}><input type="checkbox" checked={selectedItems.has(item.guid)} disabled={blocked||itemBusy} onChange={()=>toggle(item.guid)}/><div className="rss-item-main"><h3>{item.title}</h3><p>{feeds.find(feed=>feed.id===item.feedId)?.title||"RSS"} · {item.publishedAt?new Date(item.publishedAt).toLocaleString():"时间未知"}{item.matchesRule&&<i className="rule-hit">符合规则</i>}</p></div><span className={`rss-download-state ${item.download?.state||"pending"}`}>{itemBusy?"下载中":stateLabel(item)}</span><button className="ghost" onClick={()=>openUrl(item.link)}>来源 ↗</button><button className={blocked?"ghost":"primary"} disabled={blocked||itemBusy||busy==="all"||busy==="selected"} onClick={()=>downloadOne(item)}>{itemBusy?"下载中":actionLabel(item)}</button></article>})}</div></details>)}</div>{!groups.length&&<div className="empty compact"><span>◒</span><h3>没有匹配的资源</h3><p>刷新订阅或调整筛选条件。</p></div>}</>
-}
-function DownloadsPage({tasks,refresh}:{tasks:DownloadTask[];refresh:()=>Promise<void>}){
- const [busy,setBusy]=useState(""),[source,setSource]=useState(""),[title,setTitle]=useState(""),[deleting,setDeleting]=useState<{task:DownloadTask;files:boolean}|null>(null),[playing,setPlaying]=useState<PlaybackFile[]|null>(null);
- useEffect(()=>{const timer=window.setInterval(refresh,2000);return()=>window.clearInterval(timer)},[refresh]);
- async function openLocal(path:string){try{await invoke("open_local_path",{path})}catch(error){alert(`打开失败：${String(error)}`)}}
- async function action(id:string,command:string,args:Record<string,unknown>={}){setBusy(id);try{await invoke(command,{id,...args});await refresh()}catch(error){alert(String(error))}finally{setBusy("")}}
- async function play(id:string){setBusy(id);try{const files=await invoke<PlaybackFile[]>("download_playback_files",{id});if(files.length===1)await openLocal(files[0].path);else setPlaying(files)}catch(error){const fallback=tasks.find(task=>task.id===id)?.playbackPath;if(fallback)await openLocal(fallback);else alert(`无法播放：${String(error)}`)}finally{setBusy("")}}
- async function addManual(){if(!source.trim())return;setBusy("manual");try{await invoke("add_download",{source:source.trim(),title:title.trim()||"手动下载",episode:"手动添加"});setSource("");setTitle("");await refresh()}catch(error){alert(String(error))}finally{setBusy("")}}
- return <><header><div><p className="eyebrow">DOWNLOAD MANAGER</p><h1>下载管理</h1><p>暂停、继续和管理本地下载任务。</p></div><button className="ghost" onClick={refresh}>↻ 刷新</button></header><div className="manual-download"><input value={title} onChange={event=>setTitle(event.target.value)} placeholder="任务名称（可选）"/><input value={source} onChange={event=>setSource(event.target.value)} placeholder="magnet: 或 .torrent URL" onKeyDown={event=>event.key==="Enter"&&addManual()}/><button className="primary" disabled={!source.trim()||busy==="manual"} onClick={addManual}>{busy==="manual"?"添加中…":"添加任务"}</button></div><div className="download-summary"><div><span>⇩</span><strong>{formatSpeed(tasks.reduce((a,b)=>a+b.downSpeed,0))}</strong><small>下载速度</small></div><div><span>◉</span><strong>{tasks.filter(t=>t.state==="downloading").length}</strong><small>活动任务</small></div><div><span>✓</span><strong>{tasks.filter(t=>t.state==="completed").length}</strong><small>已完成</small></div></div>{tasks.length?<div className="download-list">{tasks.map(t=><article key={t.id}><div className="file-icon">{t.state==="completed"?"✓":t.state==="paused"?"Ⅱ":"⇩"}</div><div className="download-info"><div><h3>{t.title}</h3><span>{t.state==="downloading"?`${formatSpeed(t.downSpeed)} · 下载中`:t.state==="completed"?"已完成":t.state==="paused"?"已暂停":t.state==="failed"?"下载失败":t.state==="queued"?"排队中":"等待中"}</span></div><p>{t.episode}</p><div className="progress"><i style={{width:`${t.progress*100}%`}}/></div></div><strong>{Math.round(t.progress*100)}%</strong><div className="download-actions">{t.state==="downloading"&&<button disabled={busy===t.id} onClick={()=>action(t.id,"pause_download")}>暂停</button>}{t.state==="paused"&&<button disabled={busy===t.id} onClick={()=>action(t.id,"resume_download")}>继续</button>}{t.state==="completed"&&<button className="play" disabled={busy===t.id} onClick={()=>play(t.id)}>{busy===t.id?"打开中…":"▶ 播放"}</button>}<button disabled={!t.outputPath} onClick={()=>openLocal(t.outputPath)}>目录</button><button onClick={()=>setDeleting({task:t,files:false})}>移除</button><button className="danger" onClick={()=>setDeleting({task:t,files:true})}>删除文件</button></div></article>)}</div>:<div className="empty"><span>⇩</span><h3>暂无下载任务</h3><p>从 RSS 资源列表中选择条目，或在上方粘贴磁力链接。</p></div>}{deleting&&<ConfirmDialog title={deleting.files?"删除任务和文件？":"移除下载任务？"} description={deleting.files?"本地已下载的数据将一并删除，此操作无法撤销。":"任务将从列表中移除，本地已下载文件会保留。"} item={deleting.task.title} danger={deleting.files} confirmText={deleting.files?"删除文件":"仅移除任务"} onCancel={()=>setDeleting(null)} onConfirm={async()=>{const current=deleting;setDeleting(null);await action(current.task.id,"delete_download",{deleteFiles:current.files})}}/>}{playing&&<div className="confirm-backdrop" onMouseDown={()=>setPlaying(null)}><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="play-title" onMouseDown={event=>event.stopPropagation()}><div className="confirm-icon">▶</div><div><p className="eyebrow">CHOOSE EPISODE</p><h2 id="play-title">选择要播放的文件</h2><div className="play-files">{playing.map(file=><button key={file.index} onClick={()=>{setPlaying(null);openLocal(file.path)}}>{file.name}<small>{file.size>=1073741824?`${(file.size/1073741824).toFixed(2)} GB`:`${(file.size/1048576).toFixed(0)} MB`}</small></button>)}</div></div><div className="confirm-actions"><button className="ghost" autoFocus onClick={()=>setPlaying(null)}>取消</button></div></section></div>}</>
-}
-function ConfirmDialog({title,description,item,danger,confirmText,onCancel,onConfirm}:{title:string;description:string;item:string;danger?:boolean;confirmText:string;onCancel:()=>void;onConfirm:()=>void}){return <div className="confirm-backdrop" onMouseDown={onCancel}><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={event=>event.stopPropagation()}><div className={`confirm-icon${danger?" danger":""}`}>{danger?"!":"−"}</div><div><p className="eyebrow">PLEASE CONFIRM</p><h2 id="confirm-title">{title}</h2><p>{description}</p><strong title={item}>{item}</strong></div><div className="confirm-actions"><button className="ghost" autoFocus onClick={onCancel}>取消</button><button className={danger?"dialog-danger":"primary"} onClick={onConfirm}>{confirmText}</button></div></section></div>}
-function SettingsPage({profile,onProfile,onSynced,syncStatus,onSyncStatus,onSettingsSaved}:{profile:BangumiProfile|null;onProfile:(value:BangumiProfile|null)=>void;onSynced:()=>void;syncStatus:SyncStatus|null;onSyncStatus:(value:SyncStatus|null)=>void;onSettingsSaved:(settings:AppSettings)=>void}){
- const [token,setToken]=useState(""),[busy,setBusy]=useState(false),[message,setMessage]=useState(""),[settings,setSettings]=useState<AppSettings|null>(null),[appVersion,setAppVersion]=useState(""),[update,setUpdate]=useState<Update|null>(null),[updateBusy,setUpdateBusy]=useState(false),[updateMessage,setUpdateMessage]=useState("");
- useEffect(()=>{if(!isTauri())return;invoke<AppSettings>("get_settings").then(setSettings).catch(()=>{/* 浏览器预览无此命令 */});getVersion().then(setAppVersion).catch(()=>{})},[]);
- function patch(update:Partial<AppSettings>){setSettings(current=>current?{...current,...update}:current)}
- async function save(){if(!settings)return;setBusy(true);setMessage("");try{const saved=await invoke<AppSettings>("save_settings",{settings});setSettings(saved);onSettingsSaved(saved);setMessage("设置已保存并生效")}catch(error){setMessage(String(error))}finally{setBusy(false)}}
- async function checkUpdate(){setUpdateBusy(true);setUpdateMessage("");try{const found=await checkForUpdate();setUpdate(found??null);setUpdateMessage(found?`发现新版本 ${found.version}`:"已是最新版本")}catch(error){setUpdateMessage(`检查更新失败：${String(error)}`)}finally{setUpdateBusy(false)}}
- async function installUpdate(){if(!update)return;setUpdateBusy(true);try{await update.downloadAndInstall(event=>{if(event.event==="Started"&&event.data.contentLength)setUpdateMessage(`开始下载，共 ${(event.data.contentLength/1048576).toFixed(1)} MB`);else if(event.event==="Progress")setUpdateMessage(`下载中 ${(event.data.chunkLength/1048576).toFixed(1)} MB`);else if(event.event==="Finished")setUpdateMessage("下载完成，正在重启…")});await relaunch()}catch(error){setUpdateMessage(`安装失败：${String(error)}`)}finally{setUpdateBusy(false)}}
- async function connect(){if(!token.trim())return;setBusy(true);setMessage("");try{const value=await invoke<BangumiProfile>("save_bangumi_token",{token:token.trim()});onProfile(value);setToken("");const count=await invoke<number>("sync_bangumi_collections");onSynced();refreshSync();setMessage(`已连接并导入 ${count} 条收藏`)}catch(error){setMessage(String(error))}finally{setBusy(false)}}
- async function refreshSync(){try{onSyncStatus(await invoke<SyncStatus>("get_sync_status"))}catch{/* 忽略状态查询失败 */}}
- async function sync(){setBusy(true);setMessage("");try{const count=await invoke<number>("sync_bangumi_collections");onSynced();await refreshSync();setMessage(`已同步 ${count} 条收藏`)}catch(error){setMessage(String(error))}finally{setBusy(false)}}
- async function retry(){setBusy(true);setMessage("");try{const status=await invoke<SyncStatus>("retry_sync_now");onSyncStatus(status);setMessage(status.pending?"仍有条目在退避等待，稍后会自动重试":"待同步改动已全部写回 Bangumi")}catch(error){setMessage(String(error))}finally{setBusy(false)}}
- async function disconnect(){await invoke("remove_bangumi_token");onProfile(null);onSyncStatus(null);setMessage("已断开 Bangumi，本地收藏仍会保留")}
- return <><header><div><p className="eyebrow">PREFERENCES</p><h1>设置</h1><p>管理 Bangumi 连接、本地数据、下载路径与后台行为。</p></div></header><div className="settings-grid"><section><h2>Bangumi 同步</h2><div className="account">{profile?.avatar?<img className="avatar-image" src={profile.avatar}/>:<div className="avatar">本</div>}<div><h3>{profile?.nickname||profile?.username||"本地模式"}</h3><p>{profile?`@${profile.username} · 收藏改动将同步到 Bangumi`:"不填写 Token 也可正常使用本地追番"}</p></div>{profile?<button className="ghost" onClick={disconnect}>断开</button>:<span className="tag">可选</span>}</div><div className="local-data"><div className="section-title"><h3>Personal Access Token</h3><span className={profile?"configured":""}>{profile?"已安全保存":"无需 OAuth"}</span></div><p>在 Bangumi 生成 Access Token 后粘贴到这里。Token 只保存在 Windows 凭据管理器，不写入数据库。</p>{!profile&&<><label>Access Token<input type="password" value={token} onChange={e=>setToken(e.target.value)} placeholder="粘贴 Bangumi Access Token" onKeyDown={e=>e.key==="Enter"&&connect()}/></label><div className="token-actions"><button className="ghost" onClick={()=>openUrl("https://next.bgm.tv/demo/access-token")}>打开 Token 生成页 ↗</button><button className="primary" disabled={busy||!token.trim()} onClick={connect}>{busy?"验证中…":"验证并连接"}</button></div></>}{profile&&<button className="primary" disabled={busy} onClick={sync}>{busy?"同步中…":"立即同步收藏"}</button>}{profile&&syncStatus&&<div className={`sync-status${syncStatus.pending?" pending":""}`}>{syncStatus.pending?<><span>{syncStatus.pending} 条收藏改动待同步{syncStatus.lastError?` · 上次失败：${syncStatus.lastError}`:""}</span><button className="ghost" disabled={busy} onClick={retry}>立即重试</button></>:<span className="ok">✓ 收藏改动已全部同步</span>}</div>}{message&&<small className="auth-message">{message}</small>}</div></section><section><h2>下载</h2><label className="setting-row field-row"><span>下载目录</span><input value={settings?.downloadDir??""} placeholder="默认：系统下载目录\Mizuki" onChange={e=>patch({downloadDir:e.target.value.trim()||null})}/></label><label className="setting-row field-row"><span>下载限速 KB/s（0 不限）</span><input type="number" min={0} max={1000000} value={settings?.btDownloadKbps??0} onChange={e=>patch({btDownloadKbps:Math.max(0,Math.round(Number(e.target.value)||0))})}/></label><label className="setting-row field-row"><span>上传限速 KB/s（0 不限）</span><input type="number" min={0} max={1000000} value={settings?.btUploadKbps??0} onChange={e=>patch({btUploadKbps:Math.max(0,Math.round(Number(e.target.value)||0))})}/></label><label className="setting-row field-row"><span>BT 端口（0 随机，重启生效）</span><input type="number" min={0} max={65535} value={settings?.btListenPort??0} onChange={e=>patch({btListenPort:Math.min(65535,Math.max(0,Math.round(Number(e.target.value)||0)))})}/></label><label className="setting-row field-row"><span>每任务连接数（重启生效）</span><input type="number" min={1} max={2000} value={settings?.btPeerLimit??256} onChange={e=>patch({btPeerLimit:Math.min(2000,Math.max(1,Math.round(Number(e.target.value)||256)))})}/></label><label className="setting-row field-row"><span>同时下载数（0 不限）</span><input type="number" min={0} max={20} value={settings?.maxConcurrentDownloads??0} onChange={e=>patch({maxConcurrentDownloads:Math.min(20,Math.max(0,Math.round(Number(e.target.value)||0)))})}/></label><label className="setting-row field-row checkbox-row"><span>下载完成后停止做种</span><input type="checkbox" checked={settings?.stopSeedingOnComplete??true} onChange={e=>patch({stopSeedingOnComplete:e.target.checked})}/></label></section><section><h2>后台与数据</h2><label className="setting-row field-row"><span>RSS 刷新间隔（分钟）</span><input type="number" min={5} max={1440} value={settings?.rssIntervalMinutes??15} onChange={e=>patch({rssIntervalMinutes:Math.min(1440,Math.max(5,Math.round(Number(e.target.value)||15)))})}/></label><label className="setting-row field-row checkbox-row"><span>开机自动启动</span><input type="checkbox" checked={settings?.autostart??false} onChange={e=>patch({autostart:e.target.checked})}/></label><label className="setting-row field-row checkbox-row"><span>关闭窗口时最小化到托盘</span><input type="checkbox" checked={settings?.closeToTray??true} onChange={e=>patch({closeToTray:e.target.checked})}/></label><Setting label="收藏数据" value={profile?"本地 + Bangumi":"本地 SQLite"}/><div className="settings-save"><button className="primary" disabled={busy||!settings} onClick={save}>{busy?"保存中…":"保存设置"}</button></div></section>{isTauri()&&<section><h2>应用更新</h2><Setting label="当前版本" value={appVersion||"…"}/>{update&&<div className="update-available"><div><b>Mizuki {update.version} 可用</b>{update.body&&<p>{update.body}</p>}</div><button className="primary" disabled={updateBusy} onClick={installUpdate}>{updateBusy?"安装中…":"下载并重启"}</button></div>}<div className="settings-save"><button className="ghost" disabled={updateBusy} onClick={checkUpdate}>{updateBusy?"检查中…":"检查更新"}</button></div>{updateMessage&&<small className="auth-message">{updateMessage}</small>}</section>}</div></>
-}
-function Setting({label,value,button}:{label:string;value:string;button?:string}){return <div className="setting-row"><span>{label}</span><div><b>{value}</b>{button&&<button className="ghost">{button}</button>}</div></div>}
