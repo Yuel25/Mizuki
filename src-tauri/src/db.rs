@@ -7,6 +7,8 @@ use std::{collections::HashMap, path::Path, sync::Mutex};
 const MIGRATIONS: &[&str] = &[
     // v1：订阅追番——rss_feeds 关联 Bangumi 条目 ID。
     "ALTER TABLE rss_feeds ADD COLUMN subject_id INTEGER",
+    // v2：条目详情缓存——消除周表卡片的 N+1 详情请求，离线时也可回退。
+    "CREATE TABLE IF NOT EXISTS subject_details(subject_id INTEGER PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL)",
 ];
 
 fn apply_migrations(connection: &Connection) -> Result<(), String> {
@@ -643,6 +645,30 @@ impl Database {
             })
             .collect()
     }
+
+    /// 条目详情缓存：(Bangumi v0 详情 JSON, 更新时间)。
+    pub fn cached_detail(
+        &self,
+        subject_id: i64,
+    ) -> Result<Option<(serde_json::Value, String)>, String> {
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        match connection.query_row(
+            "SELECT payload,updated_at FROM subject_details WHERE subject_id=?1",
+            [subject_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ) {
+            Ok((payload, updated_at)) => Ok(Some((
+                serde_json::from_str(&payload).map_err(|e| e.to_string())?,
+                updated_at,
+            ))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    pub fn save_detail(&self, subject_id: i64, payload: &serde_json::Value) -> Result<(), String> {
+        self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO subject_details(subject_id,payload,updated_at) VALUES(?1,?2,?3) ON CONFLICT(subject_id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at",params![subject_id,payload.to_string(),chrono::Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
     pub fn save_calendar(&self, subjects: &[crate::models::Subject]) -> Result<(), String> {
         let payload = serde_json::to_string(subjects).map_err(|e| e.to_string())?;
         self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO settings(key,value) VALUES('calendar_cache',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[payload]).map_err(|e|e.to_string())?;
@@ -877,6 +903,17 @@ mod tests {
         let cached = db.cached_calendar().unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].id, 31);
+    }
+
+    #[test]
+    fn detail_cache_roundtrip_and_overwrite() {
+        let db = db();
+        assert!(db.cached_detail(11).unwrap().is_none());
+        db.save_detail(11, &serde_json::json!({"id": 11, "eps": 12})).unwrap();
+        db.save_detail(11, &serde_json::json!({"id": 11, "eps": 13})).unwrap();
+        let (payload, updated_at) = db.cached_detail(11).unwrap().expect("cached detail");
+        assert_eq!(payload["eps"], 13, "同条目重复刷新覆盖旧详情");
+        assert!(chrono::DateTime::parse_from_rfc3339(&updated_at).is_ok());
     }
 
     #[test]

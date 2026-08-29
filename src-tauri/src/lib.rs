@@ -22,7 +22,7 @@ use librqbit::{
 };
 use models::{BatchDownloadResult, DownloadTask, RssFeed, RssItem, Subject};
 use tauri::{
-    Emitter, Manager,
+    Emitter, Manager, UriSchemeContext,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
@@ -39,6 +39,10 @@ struct AppState {
     download_gate: tokio::sync::Mutex<()>,
     sync_notify: tokio::sync::Notify,
     settings: Mutex<AppSettings>,
+    /// 封面缓存目录（img_cache/{subject_id}.jpg）。
+    cover_dir: PathBuf,
+    /// Bangumi 详情拉取与封面下载共用的并发闸（避免卡片风暴打爆接口）。
+    bangumi_gate: tokio::sync::Semaphore,
 }
 
 impl AppState {
@@ -323,7 +327,9 @@ fn remove_bangumi_token() -> Result<(), String> {
 }
 
 /// 从 Bangumi 分页拉取全部动画收藏并写入本地库。手动同步与启动自动同步共用。
-async fn import_bangumi_collections(state: &AppState) -> Result<usize, String> {
+/// 完成后后台预取缺失封面。
+async fn import_bangumi_collections(app: &tauri::AppHandle) -> Result<usize, String> {
+    let state = app.state::<AppState>();
     let token = stored_access_token().ok_or("请先填写 Bangumi Access Token")?;
     let profile = bangumi::profile(&state.client, &token).await?;
     let username = profile
@@ -331,6 +337,7 @@ async fn import_bangumi_collections(state: &AppState) -> Result<usize, String> {
         .and_then(|v| v.as_str())
         .ok_or("无法识别 Bangumi 用户")?;
     let items = bangumi::collections(&state.client, &token, username).await?;
+    let mut cover_jobs = Vec::new();
     for item in &items {
         let id = item
             .get("subject_id")
@@ -348,14 +355,94 @@ async fn import_bangumi_collections(state: &AppState) -> Result<usize, String> {
         state.db.set_collection_progress(id, collection, watched)?;
         if let Some(subject) = item.get("subject") {
             state.db.cache_subject(id, subject)?;
+            if let Some(candidate) = cover_candidate(subject) {
+                cover_jobs.push(candidate);
+            }
         }
     }
+    spawn_cover_prefetch(app, cover_jobs);
     Ok(items.len())
 }
 
 #[tauri::command]
-async fn sync_bangumi_collections(state: tauri::State<'_, AppState>) -> Result<usize, String> {
-    import_bangumi_collections(&state).await
+async fn sync_bangumi_collections(app: tauri::AppHandle) -> Result<usize, String> {
+    import_bangumi_collections(&app).await
+}
+
+/// 条目详情缓存有效期。详情（评分/集数/简介）变化缓慢，一天足够新鲜。
+const DETAIL_TTL: chrono::Duration = chrono::Duration::hours(24);
+
+/// Bangumi 周表的放送日是 JST（UTC+9）语义：徽章的"今天"与前端默认 Tab 统一按此计算。
+fn jst_weekday_today(now: chrono::DateTime<chrono::Utc>) -> i64 {
+    use chrono::Datelike;
+    let jst = chrono::FixedOffset::east_opt(9 * 3600).expect("JST offset is valid");
+    now.with_timezone(&jst)
+        .weekday()
+        .num_days_from_monday() as i64
+}
+
+/// 封面缓存文件名只允许纯数字 id + .jpg，协议处理器据此拒绝目录穿越。
+fn cover_file_name(subject_id: i64) -> String {
+    format!("{subject_id}.jpg")
+}
+
+fn cover_file_name_is_valid(name: &str) -> bool {
+    let stem = name.strip_suffix(".jpg").unwrap_or_default();
+    !stem.is_empty() && stem.len() <= 20 && stem.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// 本地封面走自定义协议（Windows 下为 http://cover.localhost/*）。
+fn cover_local_url(subject_id: i64, cached: bool) -> Option<String> {
+    cached.then(|| format!("http://cover.localhost/{}", cover_file_name(subject_id)))
+}
+
+/// 从 Bangumi JSON（v0 条目或收藏内嵌 subject）提取 (subject_id, 封面 URL)。
+fn cover_candidate(value: &serde_json::Value) -> Option<(i64, String)> {
+    let id = value.get("id").and_then(serde_json::Value::as_i64)?;
+    let url = ["large", "common", "medium"]
+        .iter()
+        .find_map(|size| {
+            value
+                .pointer(&format!("/images/{size}"))
+                .and_then(serde_json::Value::as_str)
+        })?;
+    (url.starts_with("http")).then_some((id, url.to_owned()))
+}
+
+/// 下载单个封面到缓存目录。best-effort：已存在跳过，非 JPEG 或超 5MB 丢弃。
+async fn download_cover(state: &AppState, subject_id: i64, url: &str) {
+    let path = state.cover_dir.join(cover_file_name(subject_id));
+    if path.is_file() {
+        return;
+    }
+    let Ok(_permit) = state.bangumi_gate.acquire().await else {
+        return;
+    };
+    let Ok(response) = state.client.get(url).send().await else {
+        return;
+    };
+    let Ok(bytes) = response.bytes().await else {
+        return;
+    };
+    let is_jpeg = bytes.first() == Some(&0xFF) && bytes.get(1) == Some(&0xD8);
+    if !is_jpeg || bytes.len() > 5 * 1024 * 1024 {
+        return;
+    }
+    let _ = std::fs::write(path, bytes);
+}
+
+/// 后台批量预取缺失封面（best-effort，失败静默）。
+fn spawn_cover_prefetch(app: &tauri::AppHandle, candidates: Vec<(i64, String)>) {
+    if candidates.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        for (subject_id, url) in candidates {
+            download_cover(&state, subject_id, &url).await;
+        }
+    });
 }
 
 /// 周表缓存有效期：6 小时内不重复请求 Bangumi，启动更快、对源站更友好。
@@ -371,6 +458,7 @@ fn calendar_cache_fresh(refreshed_at: Option<&str>, now: chrono::DateTime<chrono
 
 #[tauri::command]
 async fn get_calendar(
+    app: tauri::AppHandle,
     force: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<CalendarPayload, String> {
@@ -408,10 +496,17 @@ async fn get_calendar(
     let collections = state.db.collections()?;
     let mut subjects =
         merge_calendar_with_collections(subjects, state.db.cached_subjects()?, &collections);
-    // 卡片更新徽章：订阅资源状态优先，无订阅时退回“今天放送”启发。
+    // 封面：在把 image 改写为本地协议地址之前收集远程地址，后台预取缺失文件。
+    let cover_jobs: Vec<(i64, String)> = subjects
+        .iter()
+        .filter_map(|subject| {
+            let url = subject.image.as_deref()?;
+            url.starts_with("http").then(|| (subject.id, url.to_owned()))
+        })
+        .collect();
+    // 卡片更新徽章：订阅资源状态优先，无订阅时退回”今天放送”启发。
     let rss_overview = state.db.subject_rss_overview().unwrap_or_default();
-    use chrono::Datelike;
-    let today = chrono::Local::now().weekday().num_days_from_monday() as i64;
+    let today = jst_weekday_today(chrono::Utc::now());
     for subject in &mut subjects {
         subject.update_state = subscriptions::compute_update_state(
             subject.collection.as_deref(),
@@ -422,7 +517,14 @@ async fn get_calendar(
             rss_overview.get(&subject.id),
         )
         .into();
+        // 已缓存的封面直接走本地协议，网格不再逐张请求 Bangumi 图床。
+        if let Some(url) =
+            cover_local_url(subject.id, state.cover_dir.join(cover_file_name(subject.id)).is_file())
+        {
+            subject.image = Some(url);
+        }
     }
+    spawn_cover_prefetch(&app, cover_jobs);
     Ok(CalendarPayload {
         subjects,
         refreshed_at,
@@ -711,6 +813,49 @@ async fn prepare_torrent_input(
         return Err("订阅地址返回的不是有效 .torrent 文件".into());
     }
     Ok((source.to_owned(), AddTorrent::from_bytes(bytes)))
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::{cover_candidate, cover_file_name_is_valid, jst_weekday_today};
+
+    #[test]
+    fn cover_file_name_rejects_traversal_and_non_numeric() {
+        assert!(cover_file_name_is_valid("3354.jpg"));
+        assert!(!cover_file_name_is_valid(".jpg"), "空 stem 拒绝");
+        assert!(!cover_file_name_is_valid("abc.jpg"));
+        assert!(!cover_file_name_is_valid("../etc/passwd.jpg"), "目录穿越拒绝");
+        assert!(!cover_file_name_is_valid("3354.gif"));
+        assert!(
+            !cover_file_name_is_valid("123456789012345678901.jpg"),
+            "超长文件名拒绝"
+        );
+    }
+
+    #[test]
+    fn jst_weekday_follows_utc_plus_nine() {
+        // 2026-08-29 12:00 UTC = 周六 21:00 JST；15:00 UTC 已跨入 JST 周日。
+        let sat = chrono::DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(jst_weekday_today(sat), 5);
+        let sun = chrono::DateTime::parse_from_rfc3339("2026-08-29T15:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(jst_weekday_today(sun), 6);
+    }
+
+    #[test]
+    fn cover_candidate_reads_images_and_requires_http() {
+        let value =
+            serde_json::json!({"id": 7, "images": {"large": "https://lain.bgm.tv/pic/cover/l/a.jpg"}});
+        assert_eq!(
+            cover_candidate(&value),
+            Some((7, "https://lain.bgm.tv/pic/cover/l/a.jpg".into()))
+        );
+        assert_eq!(cover_candidate(&serde_json::json!({"id": 7})), None);
+        assert_eq!(cover_candidate(&serde_json::json!({"id": 7, "images": {}})), None);
+    }
 }
 
 #[cfg(test)]
@@ -1706,13 +1851,44 @@ async fn get_comments(
     bangumi::comments(&state.client, subject_id, offset).await
 }
 
+/// 条目详情：24h 内直接用本地缓存（消除周表卡片 N+1）；
+/// 网络失败时回退过期缓存，离线/限流时详情页与卡片补水仍可用。
 #[tauri::command]
 async fn get_subject_detail(
+    app: tauri::AppHandle,
     subject_id: i64,
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    if let Ok(Some((value, updated_at))) = state.db.cached_detail(subject_id) {
+        let fresh = chrono::DateTime::parse_from_rfc3339(&updated_at)
+            .ok()
+            .is_some_and(|stamp| chrono::Utc::now().signed_duration_since(stamp) < DETAIL_TTL);
+        if fresh {
+            return Ok(value);
+        }
+    }
     let token = stored_access_token();
-    bangumi::subject(&state.client, token.as_deref(), subject_id).await
+    let result = {
+        let _permit = state
+            .bangumi_gate
+            .acquire()
+            .await
+            .map_err(|e| e.to_string())?;
+        bangumi::subject(&state.client, token.as_deref(), subject_id).await
+    };
+    match result {
+        Ok(value) => {
+            let _ = state.db.save_detail(subject_id, &value);
+            if let Some((id, url)) = cover_candidate(&value) {
+                spawn_cover_prefetch(&app, vec![(id, url)]);
+            }
+            Ok(value)
+        }
+        Err(error) => match state.db.cached_detail(subject_id)? {
+            Some((value, _)) => Ok(value),
+            None => Err(error),
+        },
+    }
 }
 
 #[tauri::command]
@@ -1737,10 +1913,33 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
+        // 本地封面协议：http://cover.localhost/{subject_id}.jpg，
+        // 文件名严格校验纯数字防目录穿越；命中缓存后由 max-age 交给 WebView 缓存。
+        .register_uri_scheme_protocol("cover", |ctx: UriSchemeContext<'_, tauri::Wry>, request| {
+            let name = request.uri().path().trim_start_matches('/').to_owned();
+            let cover_dir = ctx.app_handle().state::<AppState>().cover_dir.clone();
+            let respond = |status: u16, body: Vec<u8>, content_type: &'static str| {
+                tauri::http::Response::builder()
+                    .status(status)
+                    .header("Content-Type", content_type)
+                    .header("Cache-Control", "max-age=604800")
+                    .body(body)
+                    .expect("static cover response")
+            };
+            if !cover_file_name_is_valid(&name) {
+                return respond(404, Vec::new(), "text/plain");
+            }
+            match std::fs::read(cover_dir.join(name)) {
+                Ok(bytes) => respond(200, bytes, "image/jpeg"),
+                Err(_) => respond(404, Vec::new(), "text/plain"),
+            }
+        })
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             let download_path = app.path().download_dir()?.join("Mizuki");
             std::fs::create_dir_all(&download_path)?;
+            let cover_dir = data.join("img_cache");
+            std::fs::create_dir_all(&cover_dir)?;
             let db = Database::open(&data.join("mizuki.sqlite3")).map_err(std::io::Error::other)?;
             let settings = load_settings(&db);
             if let Some(dir) = &settings.download_dir {
@@ -1766,6 +1965,8 @@ pub fn run() {
                 download_gate: tokio::sync::Mutex::new(()),
                 sync_notify: tokio::sync::Notify::new(),
                 settings: Mutex::new(settings.clone()),
+                cover_dir,
+                bangumi_gate: tokio::sync::Semaphore::new(4),
             });
             if let Err(error) = apply_autostart(app.handle(), settings.autostart) {
                 eprintln!("开机启动设置未生效：{error}");
@@ -1787,13 +1988,12 @@ pub fn run() {
             // 完成后通知前端刷新周表与追番页；未连接 Token 时静默跳过。
             let import_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let state = import_app.state::<AppState>();
                 if stored_access_token().is_none() {
                     return;
                 }
                 // 稍等启动高峰（周表请求、种子恢复）过去再同步，避免争抢网络。
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                match import_bangumi_collections(&state).await {
+                match import_bangumi_collections(&import_app).await {
                     Ok(count) => {
                         let _ = import_app.emit("bangumi-imported", count);
                     }

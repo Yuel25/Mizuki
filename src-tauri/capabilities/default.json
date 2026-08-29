@@ -16,7 +16,6 @@
     {
       "identifier": "opener:allow-open-path",
       "allow": [{ "path": "$DOWNLOAD/Mizuki/**" }]
-    },
-    "deep-link:default"
+    }
   ]
 }
