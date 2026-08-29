@@ -1,6 +1,31 @@
-use crate::models::{DownloadTask, RssDownloadStatus, RssFeed, RssItem};
+use crate::models::{DownloadTask, RssDownloadStatus, RssFeed, RssItem, SubjectRssState};
 use rusqlite::{Connection, params};
 use std::{collections::HashMap, path::Path, sync::Mutex};
+
+/// 版本化迁移：MIGRATIONS[n] 把 user_version 从 n 提升到 n+1。
+/// 旧库的列探测（pragma_table_info）保留为 v0 基线，新改动一律走这里。
+const MIGRATIONS: &[&str] = &[
+    // v1：订阅追番——rss_feeds 关联 Bangumi 条目 ID。
+    "ALTER TABLE rss_feeds ADD COLUMN subject_id INTEGER",
+];
+
+fn apply_migrations(connection: &Connection) -> Result<(), String> {
+    let current: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    for (index, migration) in MIGRATIONS.iter().enumerate() {
+        let version = index as i64 + 1;
+        if current < version {
+            connection
+                .execute_batch(migration)
+                .map_err(|e| e.to_string())?;
+            connection
+                .pragma_update(None, "user_version", version)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
 
 pub fn canonical_download_source_key(source: &str) -> String {
     let source = source.trim();
@@ -134,17 +159,18 @@ impl Database {
                 [],
             )
             .map_err(|e| e.to_string())?;
+        apply_migrations(&connection)?;
         Ok(Self(Mutex::new(connection)))
     }
 
     pub fn add_feed(&self, feed: &RssFeed) -> Result<(), String> {
         let rule = serde_json::to_string(&feed.rule).map_err(|e| e.to_string())?;
-        self.0.lock().map_err(|e| e.to_string())?.execute("INSERT INTO rss_feeds(id,title,url,enabled,last_checked_at,rule_json) VALUES(?1,?2,?3,?4,?5,?6)", params![feed.id,feed.title,feed.url,feed.enabled,feed.last_checked_at,rule]).map_err(|e| e.to_string())?;
+        self.0.lock().map_err(|e| e.to_string())?.execute("INSERT INTO rss_feeds(id,title,url,enabled,last_checked_at,rule_json,subject_id) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![feed.id,feed.title,feed.url,feed.enabled,feed.last_checked_at,rule,feed.subject_id]).map_err(|e| e.to_string())?;
         Ok(())
     }
     pub fn list_feeds(&self) -> Result<Vec<RssFeed>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
-        let mut query = connection.prepare("SELECT id,title,url,enabled,last_checked_at,rule_json FROM rss_feeds ORDER BY title").map_err(|e| e.to_string())?;
+        let mut query = connection.prepare("SELECT id,title,url,enabled,last_checked_at,rule_json,subject_id FROM rss_feeds ORDER BY title").map_err(|e| e.to_string())?;
         query
             .query_map([], |row| {
                 let rule: Option<String> = row.get(5)?;
@@ -157,11 +183,19 @@ impl Database {
                     rule: rule
                         .and_then(|text| serde_json::from_str(&text).ok())
                         .unwrap_or_default(),
+                    subject_id: row.get(6)?,
                 })
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+    /// 某个 Bangumi 条目当前的追番订阅（没有则为 None）。
+    pub fn feed_for_subject(&self, subject_id: i64) -> Result<Option<RssFeed>, String> {
+        Ok(self
+            .list_feeds()?
+            .into_iter()
+            .find(|feed| feed.subject_id == Some(subject_id)))
     }
     pub fn feed(&self, id: &str) -> Result<RssFeed, String> {
         self.list_feeds()?
@@ -211,6 +245,92 @@ impl Database {
         tx.execute("DELETE FROM rss_feeds WHERE id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+    /// 取消追番订阅：删除该番剧关联的订阅源与资源列表；已产生的下载任务保留。
+    pub fn delete_feeds_for_subject(&self, subject_id: i64) -> Result<(), String> {
+        let mut connection = self.0.lock().map_err(|e| e.to_string())?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM rss_items WHERE feed_id IN (SELECT id FROM rss_feeds WHERE subject_id=?1)",
+            [subject_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM rss_feeds WHERE subject_id=?1",
+            [subject_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    /// 按番剧聚合订阅源的资源状态：正在下载 / 已下载 / 有未下载的匹配新资源。
+    /// 失败任务不计入徽章（等待用户在 RSS 页重试）。
+    pub fn subject_rss_overview(&self) -> Result<HashMap<i64, SubjectRssState>, String> {
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        let mut feed_query = connection
+            .prepare("SELECT id,subject_id,rule_json FROM rss_feeds WHERE subject_id IS NOT NULL")
+            .map_err(|e| e.to_string())?;
+        let feeds: HashMap<String, (i64, crate::models::FeedRule)> = feed_query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(id, subject_id, rule)| {
+                let rule = rule
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or_default();
+                (id, (subject_id, rule))
+            })
+            .collect();
+        if feeds.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut item_query = connection
+            .prepare(
+                "SELECT r.feed_id,r.title,r.downloaded,d.state FROM rss_items r
+                 LEFT JOIN downloads d ON d.id=r.download_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let items = item_query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut overview: HashMap<i64, SubjectRssState> = feeds
+            .values()
+            .map(|(subject_id, _)| (*subject_id, SubjectRssState::default()))
+            .collect();
+        for (feed_id, title, downloaded, task_state) in items {
+            let Some((subject_id, rule)) = feeds.get(&feed_id) else {
+                continue;
+            };
+            let entry = overview.entry(*subject_id).or_default();
+            match task_state.as_deref() {
+                Some("completed") => entry.completed = true,
+                Some("queued" | "downloading" | "paused") => entry.downloading = true,
+                Some(_) => {}
+                None => {
+                    let matches = crate::matcher::resource_matches(&title, &rule.into());
+                    if downloaded == 0 && matches {
+                        entry.pending = true;
+                    }
+                }
+            }
+        }
+        Ok(overview)
     }
 
     pub fn insert_rss_items(
@@ -748,6 +868,101 @@ mod tests {
             db.get_setting("rss_interval_minutes").unwrap().as_deref(),
             Some("30")
         );
+    }
+
+    fn subject_feed(id: &str, subject_id: Option<i64>) -> RssFeed {
+        RssFeed {
+            id: id.into(),
+            title: "测试订阅".into(),
+            url: format!("https://mikanani.me/RSS/Bangumi?bangumiId={}", subject_id.unwrap_or_default()),
+            enabled: true,
+            last_checked_at: None,
+            rule: crate::models::FeedRule::default(),
+            subject_id,
+        }
+    }
+
+    fn rss_item(guid: &str, title: &str) -> RssItem {
+        RssItem {
+            guid: guid.into(),
+            feed_id: String::new(),
+            title: title.into(),
+            link: format!("https://example.com/{guid}"),
+            torrent: None,
+            published_at: None,
+            downloaded: false,
+            download: None,
+            matches_rule: false,
+        }
+    }
+
+    #[test]
+    fn migrations_leave_user_version_at_latest() {
+        let db = db();
+        let version: i64 = db
+            .0
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn subject_feed_roundtrip_and_unsubscribe() {
+        let db = db();
+        db.add_feed(&subject_feed("f1", Some(7))).unwrap();
+        db.add_feed(&subject_feed("f2", None)).unwrap();
+        db.insert_rss_items("f1", &[rss_item("g1", "[X] 番剧 01 [1080p]")])
+            .unwrap();
+        assert_eq!(db.feed_for_subject(7).unwrap().map(|feed| feed.id), Some("f1".into()));
+        assert!(db.feed_for_subject(8).unwrap().is_none());
+        db.delete_feeds_for_subject(7).unwrap();
+        assert!(db.feed_for_subject(7).unwrap().is_none());
+        assert_eq!(db.list_feeds().unwrap().len(), 1, "普通订阅不受影响");
+        assert!(db.list_rss_items(Some("f1"), 10).unwrap().is_empty(), "取消订阅要清掉资源列表");
+    }
+
+    #[test]
+    fn subject_rss_overview_tracks_download_states() {
+        let db = db();
+        let mut feed = subject_feed("f1", Some(7));
+        feed.rule.includes = vec!["简中".into()];
+        db.add_feed(&feed).unwrap();
+        db.insert_rss_items(
+            "f1",
+            &[
+                rss_item("g1", "[喵萌] 番剧 01 [简中]"),
+                rss_item("g2", "[某组] 番剧 01 [生肉]"),
+                rss_item("g3", "[喵萌] 番剧 02 [简中]"),
+            ],
+        )
+        .unwrap();
+        db.add_download(
+            &DownloadTask {
+                id: "t1".into(),
+                title: "番剧 01".into(),
+                episode: "01".into(),
+                progress: 0.0,
+                down_speed: 0,
+                up_speed: 0,
+                state: "downloading".into(),
+                output_path: String::new(),
+                playback_path: None,
+            },
+            "magnet:?xt=urn:btih:abc",
+            "abc",
+        )
+        .unwrap();
+        db.mark_rss_downloaded("g1", "t1").unwrap();
+        let overview = db.subject_rss_overview().unwrap();
+        let state = overview.get(&7).unwrap();
+        assert!(state.downloading && state.pending && !state.completed);
+        // 全部完成后徽章转为“已下载”；不匹配规则的 g2 不算“有更新”。
+        db.set_download_state("t1", "completed").unwrap();
+        let overview = db.subject_rss_overview().unwrap();
+        let state = overview.get(&7).unwrap();
+        assert!(state.completed && state.pending && !state.downloading);
     }
 
     #[test]

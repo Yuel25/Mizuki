@@ -16,7 +16,11 @@ impl From<&FeedRule> for crate::matcher::MatchRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RssFeed { pub id:String, pub title:String, pub url:String, pub enabled:bool, pub last_checked_at:Option<String>, pub rule:FeedRule }
+pub struct RssFeed { pub id:String, pub title:String, pub url:String, pub enabled:bool, pub last_checked_at:Option<String>, pub rule:FeedRule, #[serde(default)] pub subject_id:Option<i64> }
+
+/// 订阅番剧的资源聚合状态，是卡片更新徽章（downloading/completed/published）的数据源。
+#[derive(Debug, Clone, Default)]
+pub struct SubjectRssState { pub downloading:bool, pub completed:bool, pub pending:bool }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

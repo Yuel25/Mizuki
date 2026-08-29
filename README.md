@@ -17,12 +17,13 @@ Rust 测试：`cd src-tauri && cargo test --locked`。
 
 Mizuki 采用与 Kazumi 相近的本地管理方式，不要求登录 Bangumi，也不需要创建 OAuth 应用。番剧资料、评分和公开评论取自 Bangumi；“想看 / 在看 / 看过 / 搁置 / 抛弃”等个人状态默认保存在本机 SQLite 数据库中。
 
-需要跨端同步时，可在设置页打开 Bangumi 的 Access Token 生成页，粘贴 Personal Access Token。Mizuki 会先通过 `/v0/me` 验证令牌，再将其保存到 Windows 凭据管理器；令牌不会写入 SQLite、日志或前端配置。连接后可以导入 Bangumi 收藏，收藏状态与观看集数改动会通过可靠的同步队列（失败自动指数退避重试）写回 Bangumi。
+需要跨端同步时，可在设置页打开 Bangumi 的 Access Token 生成页，粘贴 Personal Access Token。Mizuki 会先通过 `/v0/me` 验证令牌，再将其保存到 Windows 凭据管理器；令牌不会写入 SQLite、日志或前端配置。连接后每次启动 Mizuki 都会自动拉取一次 Bangumi 收藏，也可以在设置页手动同步；收藏状态与观看集数改动会通过可靠的同步队列（失败自动指数退避重试）写回 Bangumi。
 
 ## RSS 与下载
 
+- 在番剧详情页一键订阅：Mizuki 按条目生成 Mikan 单番 RSS，新集发布时按规则自动下载；追番卡片会显示“有更新 / 下载中 / 已下载”。
 - 支持为每个 Mikan RSS 订阅配置匹配规则（必须包含 / 排除 / 分辨率 / 字幕组）与自动下载开关。
-- 内置 librqbit 下载器：限速、端口、连接数、同时下载数、完成后停止做种、自定义下载目录均可配置。
+- 内置 librqbit 下载器：限速、端口、连接数、同时下载数、完成后停止做种、自定义下载目录均可配置；下载完成时发送系统通知。
 - 下载完成的任务可直接播放；多视频合集会弹出选集对话框。
 
 ## 构建

@@ -3,6 +3,7 @@ mod db;
 mod feeds;
 mod matcher;
 mod models;
+mod subscriptions;
 
 use std::{
     collections::HashMap,
@@ -21,10 +22,11 @@ use librqbit::{
 };
 use models::{BatchDownloadResult, DownloadTask, RssFeed, RssItem, Subject};
 use tauri::{
-    Manager,
+    Emitter, Manager,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
+use tauri_plugin_notification::NotificationExt;
 
 struct AppState {
     db: Database,
@@ -320,8 +322,8 @@ fn remove_bangumi_token() -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-async fn sync_bangumi_collections(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+/// 从 Bangumi 分页拉取全部动画收藏并写入本地库。手动同步与启动自动同步共用。
+async fn import_bangumi_collections(state: &AppState) -> Result<usize, String> {
     let token = stored_access_token().ok_or("请先填写 Bangumi Access Token")?;
     let profile = bangumi::profile(&state.client, &token).await?;
     let username = profile
@@ -352,26 +354,75 @@ async fn sync_bangumi_collections(state: tauri::State<'_, AppState>) -> Result<u
 }
 
 #[tauri::command]
-async fn get_calendar(state: tauri::State<'_, AppState>) -> Result<CalendarPayload, String> {
-    let (subjects, stale, warning, refreshed_at) = match bangumi::calendar(&state.client).await
+async fn sync_bangumi_collections(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    import_bangumi_collections(&state).await
+}
+
+/// 周表缓存有效期：6 小时内不重复请求 Bangumi，启动更快、对源站更友好。
+const CALENDAR_TTL: chrono::Duration = chrono::Duration::hours(6);
+const CALENDAR_REFRESHED_KEY: &str = "calendar_refreshed_at";
+
+/// 周表缓存是否仍新鲜：缺时间戳或无法解析都视为过期。
+fn calendar_cache_fresh(refreshed_at: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    refreshed_at
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|stamp| now.signed_duration_since(stamp) < CALENDAR_TTL)
+}
+
+#[tauri::command]
+async fn get_calendar(
+    force: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<CalendarPayload, String> {
+    let force = force.unwrap_or(false);
+    let mut refreshed_at = state
+        .db
+        .get_setting(CALENDAR_REFRESHED_KEY)
+        .ok()
+        .flatten();
+    let (subjects, stale, warning) = if !force
+        && calendar_cache_fresh(refreshed_at.as_deref(), chrono::Utc::now())
+        && let Ok(cached) = state.db.cached_calendar()
+        && !cached.is_empty()
     {
-        Ok(subjects) => {
-            state.db.save_calendar(&subjects)?;
-            (subjects, false, None, Some(chrono::Utc::now().to_rfc3339()))
-        }
-        Err(error) => match state.db.cached_calendar() {
-            Ok(subjects) if !subjects.is_empty() => (
-                subjects,
-                true,
-                Some(format!("{error}，已显示上次缓存")),
-                None,
-            ),
-            _ => return Err(error),
+        (cached, false, None)
+    } else {
+        match bangumi::calendar(&state.client).await {
+            Ok(fresh) => {
+                state.db.save_calendar(&fresh)?;
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = state.db.set_setting(CALENDAR_REFRESHED_KEY, &now);
+                refreshed_at = Some(now);
+                (fresh, false, None)
+            }
+            Err(error) => match state.db.cached_calendar() {
+                Ok(cached) if !cached.is_empty() => (
+                    cached,
+                    true,
+                    Some(format!("{error}，已显示上次缓存")),
+                ),
+                _ => return Err(error),
+            },
         }
     };
     let collections = state.db.collections()?;
-    let subjects =
+    let mut subjects =
         merge_calendar_with_collections(subjects, state.db.cached_subjects()?, &collections);
+    // 卡片更新徽章：订阅资源状态优先，无订阅时退回“今天放送”启发。
+    let rss_overview = state.db.subject_rss_overview().unwrap_or_default();
+    use chrono::Datelike;
+    let today = chrono::Local::now().weekday().num_days_from_monday() as i64;
+    for subject in &mut subjects {
+        subject.update_state = subscriptions::compute_update_state(
+            subject.collection.as_deref(),
+            subject.watched,
+            subject.episodes,
+            subject.air_weekday,
+            today,
+            rss_overview.get(&subject.id),
+        )
+        .into();
+    }
     Ok(CalendarPayload {
         subjects,
         refreshed_at,
@@ -453,10 +504,53 @@ async fn add_rss_feed(url: String, state: tauri::State<'_, AppState>) -> Result<
         enabled: true,
         last_checked_at: Some(chrono::Utc::now().to_rfc3339()),
         rule: models::FeedRule::default(),
+        subject_id: None,
     };
     state.db.add_feed(&feed)?;
     state.db.insert_rss_items(&feed.id, &items)?;
     Ok(feed)
+}
+
+/// 追番订阅：按 Bangumi 条目创建 Mikan 单番 RSS，新集经规则自动下载。
+/// 订阅时已有的资源只入列不自动下载（避免补全库式批量下载）。
+#[tauri::command]
+async fn subscribe_subject(
+    subject_id: i64,
+    name: String,
+    name_cn: String,
+    subtitle_group: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<RssFeed, String> {
+    if let Some(existing) = state.db.feed_for_subject(subject_id)? {
+        return Ok(existing);
+    }
+    let url = subscriptions::build_mikan_rss_url(subject_id);
+    // 先验证 RSS 可读再落库，避免留下永远刷不动的订阅。
+    let (mut title, items) = feeds::fetch(&state.client, &url).await?;
+    if title.trim().is_empty() {
+        title = if name_cn.trim().is_empty() {
+            name
+        } else {
+            name_cn
+        };
+    }
+    let feed = RssFeed {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: title.trim().to_owned(),
+        url,
+        enabled: true,
+        last_checked_at: Some(chrono::Utc::now().to_rfc3339()),
+        rule: subscriptions::default_subscription_rule(subtitle_group.as_deref()),
+        subject_id: Some(subject_id),
+    };
+    state.db.add_feed(&feed)?;
+    state.db.insert_rss_items(&feed.id, &items)?;
+    Ok(feed)
+}
+
+#[tauri::command]
+fn unsubscribe_subject(subject_id: i64, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.db.delete_feeds_for_subject(subject_id)
 }
 
 #[tauri::command]
@@ -614,10 +708,21 @@ async fn prepare_torrent_input(
 
 #[cfg(test)]
 mod calendar_merge_tests {
-    use super::merge_calendar_with_collections;
+    use super::{merge_calendar_with_collections, CALENDAR_TTL, calendar_cache_fresh};
     use crate::bangumi::subject_from_v0;
     use crate::models::Subject;
     use std::collections::HashMap;
+
+    #[test]
+    fn calendar_cache_respects_ttl() {
+        let now = chrono::Utc::now();
+        let fresh = (now - chrono::Duration::hours(5)).to_rfc3339();
+        let stale = (now - CALENDAR_TTL - chrono::Duration::minutes(1)).to_rfc3339();
+        assert!(calendar_cache_fresh(Some(&fresh), now));
+        assert!(!calendar_cache_fresh(Some(&stale), now), "超过 TTL 必须重新请求");
+        assert!(!calendar_cache_fresh(None, now), "从未刷新过不能走缓存");
+        assert!(!calendar_cache_fresh(Some("not-a-date"), now));
+    }
 
     fn cached(value: serde_json::Value) -> serde_json::Value {
         value
@@ -1131,6 +1236,16 @@ fn list_downloads(
             .into();
             if stats.finished && !was_completed {
                 completed_now = true;
+                // 只在任务真正完成的那一刻通知一次（was_completed 防止轮询重复）。
+                if let Err(error) = app
+                    .notification()
+                    .builder()
+                    .title("下载完成")
+                    .body(&task.title)
+                    .show()
+                {
+                    eprintln!("系统通知发送失败：{error}");
+                }
                 // 完成后可选自动暂停（停止做种），由设置控制。
                 if state.settings().stop_seeding_on_complete {
                     let session = state.bt.clone();
@@ -1614,6 +1729,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             let download_path = app.path().download_dir()?.join("Mizuki");
@@ -1658,6 +1774,23 @@ pub fn run() {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(45)) => {}
                         _ = state.sync_notify.notified() => {}
                     }
+                }
+            });
+            // 启动自动同步：已连接 Bangumi 时每次启动拉取一次最新收藏，
+            // 完成后通知前端刷新周表与追番页；未连接 Token 时静默跳过。
+            let import_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = import_app.state::<AppState>();
+                if stored_access_token().is_none() {
+                    return;
+                }
+                // 稍等启动高峰（周表请求、种子恢复）过去再同步，避免争抢网络。
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                match import_bangumi_collections(&state).await {
+                    Ok(count) => {
+                        let _ = import_app.emit("bangumi-imported", count);
+                    }
+                    Err(error) => eprintln!("启动同步 Bangumi 收藏失败：{error}"),
                 }
             });
             let restore_app = app.handle().clone();
@@ -1805,6 +1938,8 @@ pub fn run() {
             save_bangumi_token,
             remove_bangumi_token,
             sync_bangumi_collections,
+            subscribe_subject,
+            unsubscribe_subject,
             add_rss_feed,
             list_rss_feeds,
             list_rss_items,
