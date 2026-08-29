@@ -16,11 +16,12 @@ fn apply_migrations(connection: &Connection) -> Result<(), String> {
     for (index, migration) in MIGRATIONS.iter().enumerate() {
         let version = index as i64 + 1;
         if current < version {
+            // DDL 与版本号必须在一个事务内原子生效：
+            // 否则中途崩溃重开时会重放已执行的 ALTER 并报重复列，数据库无法打开。
             connection
-                .execute_batch(migration)
-                .map_err(|e| e.to_string())?;
-            connection
-                .pragma_update(None, "user_version", version)
+                .execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version={version}; COMMIT;"
+                ))
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -197,6 +198,25 @@ impl Database {
             .into_iter()
             .find(|feed| feed.subject_id == Some(subject_id)))
     }
+    /// 按 URL 查找订阅源：用户可能早已手动添加过同一 Mikan 单番地址。
+    pub fn feed_by_url(&self, url: &str) -> Result<Option<RssFeed>, String> {
+        Ok(self
+            .list_feeds()?
+            .into_iter()
+            .find(|feed| feed.url == url))
+    }
+    /// 把已有订阅源收编为某条目的追番订阅：关联 subject_id 并确保启用。
+    pub fn adopt_feed_as_subscription(&self, id: &str, subject_id: i64) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "UPDATE rss_feeds SET subject_id=?2,enabled=1 WHERE id=?1",
+                params![id, subject_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
     pub fn feed(&self, id: &str) -> Result<RssFeed, String> {
         self.list_feeds()?
             .into_iter()
@@ -263,7 +283,7 @@ impl Database {
         tx.commit().map_err(|e| e.to_string())
     }
     /// 按番剧聚合订阅源的资源状态：正在下载 / 已下载 / 有未下载的匹配新资源。
-    /// 失败任务不计入徽章（等待用户在 RSS 页重试）。
+    /// 暂停与失败任务不计入徽章（等待用户在下载页或 RSS 页处理）。
     pub fn subject_rss_overview(&self) -> Result<HashMap<i64, SubjectRssState>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
         let mut feed_query = connection
@@ -294,7 +314,8 @@ impl Database {
         let mut item_query = connection
             .prepare(
                 "SELECT r.feed_id,r.title,r.downloaded,d.state FROM rss_items r
-                 LEFT JOIN downloads d ON d.id=r.download_id",
+                 LEFT JOIN downloads d ON d.id=r.download_id
+                 WHERE r.feed_id IN (SELECT id FROM rss_feeds WHERE subject_id IS NOT NULL)",
             )
             .map_err(|e| e.to_string())?;
         let items = item_query
@@ -320,8 +341,8 @@ impl Database {
             let entry = overview.entry(*subject_id).or_default();
             match task_state.as_deref() {
                 Some("completed") => entry.completed = true,
-                Some("queued" | "downloading" | "paused") => entry.downloading = true,
-                Some(_) => {}
+                Some("queued" | "downloading") => entry.downloading = true,
+                Some(_) => {} // 已暂停/失败：不计入徽章
                 None => {
                     let matches = crate::matcher::resource_matches(&title, &rule.into());
                     if downloaded == 0 && matches {
@@ -921,6 +942,21 @@ mod tests {
         assert!(db.feed_for_subject(7).unwrap().is_none());
         assert_eq!(db.list_feeds().unwrap().len(), 1, "普通订阅不受影响");
         assert!(db.list_rss_items(Some("f1"), 10).unwrap().is_empty(), "取消订阅要清掉资源列表");
+    }
+
+    #[test]
+    fn subscribe_adopts_existing_feed_with_same_url() {
+        // 用户手动添加过同一单番地址时，订阅必须收编而不是撞 UNIQUE 约束报错。
+        let db = db();
+        let mut manual = subject_feed("f1", None);
+        manual.url = "https://mikanani.me/RSS/Bangumi?bangumiId=9".into();
+        db.add_feed(&manual).unwrap();
+        db.set_feed_enabled("f1", false).unwrap();
+        db.adopt_feed_as_subscription("f1", 9).unwrap();
+        let adopted = db.feed_for_subject(9).unwrap().expect("adopted feed");
+        assert_eq!(adopted.id, "f1");
+        assert_eq!(adopted.subject_id, Some(9));
+        assert!(adopted.enabled, "收编为订阅时要重新启用");
     }
 
     #[test]

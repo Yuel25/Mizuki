@@ -525,6 +525,13 @@ async fn subscribe_subject(
         return Ok(existing);
     }
     let url = subscriptions::build_mikan_rss_url(subject_id);
+    // 用户可能早已手动添加过同一单番地址：直接收编为追番订阅，避免 UNIQUE 冲突。
+    if let Some(mut existing) = state.db.feed_by_url(&url)? {
+        state.db.adopt_feed_as_subscription(&existing.id, subject_id)?;
+        existing.subject_id = Some(subject_id);
+        existing.enabled = true;
+        return Ok(existing);
+    }
     // 先验证 RSS 可读再落库，避免留下永远刷不动的订阅。
     let (mut title, items) = feeds::fetch(&state.client, &url).await?;
     if title.trim().is_empty() {

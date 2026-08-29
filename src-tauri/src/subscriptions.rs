@@ -24,6 +24,7 @@ pub fn default_subscription_rule(subtitle_group: Option<&str>) -> FeedRule {
 }
 
 /// 卡片更新徽章判定。订阅驱动的状态优先（来自真实资源），
+/// 有未下载的匹配资源时“有更新”要让用户看见，不能被“已下载”挡住；
 /// 无订阅时仅对“在看 + 今天放送 + 未看完”给“有更新”提示。
 pub fn compute_update_state(
     collection: Option<&str>,
@@ -37,11 +38,11 @@ pub fn compute_update_state(
         if rss.downloading {
             return "downloading";
         }
-        if rss.completed {
-            return "completed";
-        }
         if rss.pending {
             return "published";
+        }
+        if rss.completed {
+            return "completed";
         }
     }
     if collection == Some("doing")
@@ -89,8 +90,14 @@ mod tests {
         let rss = SubjectRssState { downloading: false, completed: true, pending: true };
         assert_eq!(
             compute_update_state(Some("doing"), 3, 12, 1, 1, Some(&rss)),
+            "published",
+            "已有下载但存在未下载的新资源时，有更新不能被已下载挡住"
+        );
+        let rss = SubjectRssState { downloading: false, completed: true, pending: false };
+        assert_eq!(
+            compute_update_state(Some("collect"), 12, 12, 1, 1, Some(&rss)),
             "completed",
-            "已下载优先于“有更新”"
+            "匹配资源全部下载完才显示已下载"
         );
         let rss = SubjectRssState { downloading: false, completed: false, pending: true };
         assert_eq!(
