@@ -3,6 +3,8 @@
 use crate::state::AppState;
 use tauri::Manager;
 
+const MAX_COVER_BYTES: usize = 5 * 1024 * 1024;
+
 /// 本地封面走自定义协议（Windows 下为 http://cover.localhost/*）。
 pub(crate) fn cover_local_url(subject_id: i64, cached: bool) -> Option<String> {
     cached.then(|| format!("http://cover.localhost/{}", cover_file_name(subject_id)))
@@ -38,14 +40,39 @@ async fn download_cover(state: &AppState, subject_id: i64, url: &str) {
     let Ok(_permit) = state.bangumi_gate.acquire().await else {
         return;
     };
-    let Ok(response) = state.client.get(url).send().await else {
+    let Ok(mut response) = state.client.get(url).send().await else {
         return;
     };
-    let Ok(bytes) = response.bytes().await else {
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_COVER_BYTES as u64)
+    {
         return;
-    };
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_COVER_BYTES as u64) as usize,
+    );
+    loop {
+        let Ok(chunk) = response.chunk().await else {
+            return;
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let Some(next_len) = bytes.len().checked_add(chunk.len()) else {
+            return;
+        };
+        if next_len > MAX_COVER_BYTES {
+            return;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     let is_jpeg = bytes.first() == Some(&0xFF) && bytes.get(1) == Some(&0xD8);
-    if !is_jpeg || bytes.len() > 5 * 1024 * 1024 {
+    if !is_jpeg {
         return;
     }
     let _ = std::fs::write(path, bytes);
