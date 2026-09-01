@@ -6,7 +6,7 @@ use crate::bt::download_source_key;
 use crate::downloads::start_download;
 use crate::models::{BatchDownloadResult, DownloadTask, FeedRule, RssFeed, RssItem};
 use crate::state::AppState;
-use crate::{feeds, matcher, subscriptions};
+use crate::{bgmlist, feeds, matcher, subscriptions};
 use tauri::State;
 
 #[tauri::command]
@@ -39,10 +39,14 @@ pub(crate) async fn subscribe_subject(
     subtitle_group: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<RssFeed, String> {
+    let mikan_id = bgmlist::mikan_id_for_bangumi(&state.client, subject_id).await?;
+    let url = subscriptions::build_mikan_rss_url(mikan_id);
+    state
+        .db
+        .migrate_mikan_subscription_urls(&HashMap::from([(subject_id, mikan_id)]))?;
     if let Some(existing) = state.db.feed_for_subject(subject_id)? {
         return Ok(existing);
     }
-    let url = subscriptions::build_mikan_rss_url(subject_id);
     // 用户可能早已手动添加过同一单番地址：直接收编为追番订阅，避免 UNIQUE 冲突。
     if let Some(mut existing) = state.db.feed_by_url(&url)? {
         state

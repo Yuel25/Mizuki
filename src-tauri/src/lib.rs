@@ -2,6 +2,7 @@
 //! 业务按域拆分在 settings/bt/downloads/rss/collection/calendar/covers 等模块。
 
 mod bangumi;
+mod bgmlist;
 mod bt;
 mod calendar;
 mod collection;

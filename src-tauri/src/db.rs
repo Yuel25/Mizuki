@@ -204,6 +204,60 @@ impl Database {
     pub fn feed_by_url(&self, url: &str) -> Result<Option<RssFeed>, String> {
         Ok(self.list_feeds()?.into_iter().find(|feed| feed.url == url))
     }
+    /// v0.3.2 及更早版本误把 Bangumi ID 当成 Mikan ID。
+    /// bgmlist 提供精确映射后，迁移错误 URL 并清掉旧源条目，下一次刷新会重新发现正确资源。
+    pub fn migrate_mikan_subscription_urls(
+        &self,
+        mappings: &HashMap<i64, i64>,
+    ) -> Result<usize, String> {
+        let mut connection = self.0.lock().map_err(|e| e.to_string())?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let mut migrated = 0;
+        for (&subject_id, &mikan_id) in mappings {
+            let legacy_url = crate::subscriptions::build_mikan_rss_url(subject_id);
+            let correct_url = crate::subscriptions::build_mikan_rss_url(mikan_id);
+            if legacy_url == correct_url {
+                continue;
+            }
+            let legacy_id = tx
+                .query_row(
+                    "SELECT id FROM rss_feeds WHERE subject_id=?1 AND url=?2",
+                    params![subject_id, legacy_url],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            let Some(legacy_id) = legacy_id else {
+                continue;
+            };
+            let correct_id = tx
+                .query_row(
+                    "SELECT id FROM rss_feeds WHERE url=?1",
+                    [&correct_url],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            tx.execute("DELETE FROM rss_items WHERE feed_id=?1", [&legacy_id])
+                .map_err(|e| e.to_string())?;
+            if let Some(correct_id) = correct_id {
+                tx.execute("DELETE FROM rss_feeds WHERE id=?1", [&legacy_id])
+                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE rss_feeds SET subject_id=?2,enabled=1 WHERE id=?1",
+                    params![correct_id, subject_id],
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                tx.execute(
+                    "UPDATE rss_feeds SET url=?2,last_checked_at=NULL,enabled=1 WHERE id=?1",
+                    params![legacy_id, correct_url],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            migrated += 1;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(migrated)
+    }
     /// 把已有订阅源收编为某条目的追番订阅：关联 subject_id 并确保启用。
     pub fn adopt_feed_as_subscription(&self, id: &str, subject_id: i64) -> Result<(), String> {
         self.0
@@ -1006,6 +1060,30 @@ mod tests {
         assert_eq!(adopted.id, "f1");
         assert_eq!(adopted.subject_id, Some(9));
         assert!(adopted.enabled, "收编为订阅时要重新启用");
+    }
+
+    #[test]
+    fn migrates_legacy_bangumi_id_subscription_to_mikan_id() {
+        let db = db();
+        let mut feed = subject_feed("legacy", Some(633836));
+        feed.url = crate::subscriptions::build_mikan_rss_url(633836);
+        db.add_feed(&feed).unwrap();
+        db.insert_rss_items(&feed.id, &[rss_item("old", "旧错误源资源")])
+            .unwrap();
+        let migrated = db
+            .migrate_mikan_subscription_urls(&HashMap::from([(633836, 4052)]))
+            .unwrap();
+        assert_eq!(migrated, 1);
+        let migrated = db.feed_for_subject(633836).unwrap().unwrap();
+        assert_eq!(
+            migrated.url,
+            crate::subscriptions::build_mikan_rss_url(4052)
+        );
+        assert!(
+            db.list_rss_items(Some(&migrated.id), 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

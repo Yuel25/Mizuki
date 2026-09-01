@@ -1,4 +1,5 @@
 use crate::models::Subject;
+use chrono::Datelike;
 use serde_json::Value;
 
 fn number(value: Option<&Value>) -> f64 {
@@ -15,6 +16,26 @@ fn https_image(url: Option<String>) -> Option<String> {
             url
         }
     })
+}
+
+/// v0 搜索/收藏条目不一定带 `air_weekday`，但通常带首播日期。
+/// `/calendar` 偶尔会漏番，因此缓存条目需要能从日期恢复放送星期。
+pub(crate) fn subject_air_weekday(value: &Value) -> i64 {
+    if let Some(day) = value
+        .get("air_weekday")
+        .or_else(|| value.get("airWeekday"))
+        .and_then(Value::as_i64)
+        .filter(|day| (1..=7).contains(day))
+    {
+        return day - 1;
+    }
+    value
+        .get("date")
+        .or_else(|| value.get("air_date"))
+        .and_then(Value::as_str)
+        .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        .map(|date| date.weekday().num_days_from_monday() as i64)
+        .unwrap_or(-1)
 }
 
 pub fn subject_from_v0(value: &Value, collection: Option<String>, watched: i64) -> Subject {
@@ -48,7 +69,7 @@ pub fn subject_from_v0(value: &Value, collection: Option<String>, watched: i64) 
             .and_then(Value::as_i64)
             .or_else(|| value.get("rank").and_then(Value::as_i64))
             .filter(|rank| *rank > 0),
-        air_weekday: -1,
+        air_weekday: subject_air_weekday(value),
         collection,
         episodes: value
             .get("total_episodes")
@@ -85,11 +106,8 @@ pub async fn calendar(client: &reqwest::Client) -> Result<Vec<Subject>, String> 
             .flatten()
         {
             let mut subject = subject_from_v0(value, None, 0);
-            let item_day = value
-                .get("air_weekday")
-                .and_then(Value::as_i64)
-                .filter(|day| (1..=7).contains(day));
-            subject.air_weekday = item_day.map(|day| day - 1).unwrap_or(weekday);
+            let item_day = subject_air_weekday(value);
+            subject.air_weekday = if item_day >= 0 { item_day } else { weekday };
             out.push(subject);
         }
     }

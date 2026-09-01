@@ -4,8 +4,8 @@
 use crate::models::{FeedRule, SubjectRssState};
 
 /// Mikan 单番 RSS 地址：一部番剧一个订阅源，字幕组/画质偏好交给规则过滤。
-pub fn build_mikan_rss_url(subject_id: i64) -> String {
-    format!("https://mikanani.me/RSS/Bangumi?bangumiId={subject_id}")
+pub fn build_mikan_rss_url(mikan_id: i64) -> String {
+    format!("https://mikanani.me/RSS/Bangumi?bangumiId={mikan_id}")
 }
 
 /// 订阅默认规则：不筛内容、新资源直接自动下载；字幕组偏好可选。
@@ -62,8 +62,8 @@ mod tests {
     #[test]
     fn builds_mikan_per_subject_rss_url() {
         assert_eq!(
-            build_mikan_rss_url(3354),
-            "https://mikanani.me/RSS/Bangumi?bangumiId=3354"
+            build_mikan_rss_url(4052),
+            "https://mikanani.me/RSS/Bangumi?bangumiId=4052"
         );
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "mizuki"
-version = "0.3.2"
+version = "0.3.3"
 license = "MIT"
 description = "Bangumi anime tracker and Mikan RSS download manager"
 authors = ["Mizuki contributors"]

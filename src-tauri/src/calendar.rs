@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::bangumi::{self, stored_access_token};
+use crate::bgmlist;
 use crate::covers::{cover_candidate, cover_file_name, cover_local_url, spawn_cover_prefetch};
 use crate::matcher;
 use crate::models::Subject;
@@ -50,6 +51,10 @@ fn calendar_cache_fresh(refreshed_at: Option<&str>, now: chrono::DateTime<chrono
 fn subject_from_cache(value: &serde_json::Value) -> Subject {
     let mut subject = serde_json::from_value::<Subject>(value.clone())
         .unwrap_or_else(|_| bangumi::subject_from_v0(value, None, 0));
+    // 旧缓存中的 Subject 把未知星期保存为 -1；尝试从同一 payload 的首播日期恢复。
+    if subject.air_weekday < 0 {
+        subject.air_weekday = bangumi::subject_air_weekday(value);
+    }
     // 缓存里存的旧 JSON 可能还是 http 图片地址，读取时统一升级。
     let needs_upgrade = subject.image.as_deref().is_some_and(|image| {
         image.starts_with("http://lain.bgm.tv/") || image.starts_with("http://bgm.tv/")
@@ -94,6 +99,18 @@ fn merge_calendar_with_collections(
     subjects
 }
 
+/// Bangumi 为主、bgmlist 补漏；相同 Bangumi ID 保留主源的完整评分与封面数据。
+fn merge_calendar_sources(mut primary: Vec<Subject>, supplement: Vec<Subject>) -> Vec<Subject> {
+    let mut known: std::collections::HashSet<i64> =
+        primary.iter().map(|subject| subject.id).collect();
+    primary.extend(
+        supplement
+            .into_iter()
+            .filter(|subject| known.insert(subject.id)),
+    );
+    primary
+}
+
 #[tauri::command]
 pub(crate) async fn get_calendar(
     app: AppHandle,
@@ -109,15 +126,40 @@ pub(crate) async fn get_calendar(
     {
         (cached, false, None)
     } else {
-        match bangumi::calendar(&state.client).await {
-            Ok(fresh) => {
+        let (bangumi_result, bgmlist_result) = tokio::join!(
+            bangumi::calendar(&state.client),
+            bgmlist::calendar(&state.client)
+        );
+        match (bangumi_result, bgmlist_result) {
+            (Ok(primary), supplement) => {
+                let supplement = supplement.ok();
+                if let Some(data) = &supplement {
+                    let _ = state.db.migrate_mikan_subscription_urls(&data.mikan_ids);
+                }
+                let fresh = merge_calendar_sources(
+                    primary,
+                    supplement.map(|data| data.subjects).unwrap_or_default(),
+                );
                 state.db.save_calendar(&fresh)?;
                 let now = chrono::Utc::now().to_rfc3339();
                 let _ = state.db.set_setting(CALENDAR_REFRESHED_KEY, &now);
                 refreshed_at = Some(now);
                 (fresh, false, None)
             }
-            Err(error) => match state.db.cached_calendar() {
+            (Err(_), Ok(data)) => {
+                let _ = state.db.migrate_mikan_subscription_urls(&data.mikan_ids);
+                let fresh = data.subjects;
+                state.db.save_calendar(&fresh)?;
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = state.db.set_setting(CALENDAR_REFRESHED_KEY, &now);
+                refreshed_at = Some(now);
+                (
+                    fresh,
+                    false,
+                    Some("Bangumi 周表不可用，当前由 bgmlist 补充显示".into()),
+                )
+            }
+            (Err(error), Err(_)) => match state.db.cached_calendar() {
                 Ok(cached) if !cached.is_empty() => {
                     (cached, true, Some(format!("{error}，已显示上次缓存")))
                 }
@@ -282,7 +324,8 @@ pub(crate) async fn get_subject_detail(
 #[cfg(test)]
 mod tests {
     use super::{
-        CALENDAR_TTL, calendar_cache_fresh, jst_weekday_today, merge_calendar_with_collections,
+        CALENDAR_TTL, calendar_cache_fresh, jst_weekday_today, merge_calendar_sources,
+        merge_calendar_with_collections,
     };
     use crate::bangumi::subject_from_v0;
     use crate::models::Subject;
@@ -370,5 +413,34 @@ mod tests {
         assert_eq!(subject.name_cn, "原始");
         assert!((subject.score - 7.1).abs() < f64::EPSILON);
         assert_eq!(subject.episodes, 13);
+    }
+
+    #[test]
+    fn missing_calendar_entry_recovers_weekday_from_cached_air_date() {
+        let cached = vec![serde_json::json!({
+            "id": 633836,
+            "name": "Re:Zero",
+            "name_cn": "Re：从零开始的异世界生活 第四季 夺还篇",
+            "date": "2026-08-12"
+        })];
+        let collections = HashMap::from([collection(633836, "doing", 3)]);
+        let merged = merge_calendar_with_collections(Vec::new(), cached, &collections);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].air_weekday, 2, "2026-08-12 是周三");
+    }
+
+    #[test]
+    fn bgmlist_supplements_but_does_not_replace_bangumi_subjects() {
+        let primary = vec![subject_from_v0(
+            &serde_json::json!({"id": 1, "name": "Primary", "rating": {"score": 8.0}}),
+            None,
+            0,
+        )];
+        let duplicate = subject_from_v0(&serde_json::json!({"id": 1, "name": "Fallback"}), None, 0);
+        let missing = subject_from_v0(&serde_json::json!({"id": 2, "name": "Missing"}), None, 0);
+        let merged = merge_calendar_sources(primary, vec![duplicate, missing]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "Primary");
+        assert_eq!(merged[1].id, 2);
     }
 }
