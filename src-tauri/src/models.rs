@@ -76,6 +76,13 @@ pub struct DownloadTask {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StoredFileInfo {
+    pub relative_path: String,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RssItem {
     pub guid: String,
     pub feed_id: String,

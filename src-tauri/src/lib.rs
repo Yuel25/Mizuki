@@ -119,7 +119,9 @@ pub fn run() {
                 download_path,
                 trackers: tokio::sync::RwLock::new(None),
                 download_gate: tokio::sync::Mutex::new(()),
+                sync_gate: tokio::sync::Mutex::new(()),
                 sync_notify: tokio::sync::Notify::new(),
+                promote_failures: Mutex::new(HashMap::new()),
                 settings: Mutex::new(settings.clone()),
                 cover_dir,
                 bangumi_gate: tokio::sync::Semaphore::new(4),
@@ -158,6 +160,16 @@ pub fn run() {
             });
             restore_downloads(app.handle());
 
+            // 后台常驻检查下载状态与推进队列：脱离下载页面仍能推进并发调度与发送完成通知。
+            let download_monitor_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    downloads::check_download_progress_and_promote(&download_monitor_app).await;
+                }
+            });
+
             let show = MenuItem::with_id(app, "show", "显示 Mizuki", true, None::<&str>)?;
             let pause = MenuItem::with_id(app, "pause", "暂停全部下载", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -181,6 +193,7 @@ pub fn run() {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let state = app.state::<AppState>();
+                            let _guard = state.download_gate.lock().await;
                             let handles = state
                                 .handles
                                 .lock()

@@ -1,4 +1,6 @@
-use crate::models::{DownloadTask, RssDownloadStatus, RssFeed, RssItem, SubjectRssState};
+use crate::models::{
+    DownloadTask, RssDownloadStatus, RssFeed, RssItem, StoredFileInfo, SubjectRssState,
+};
 use rusqlite::{Connection, params};
 use std::{collections::HashMap, path::Path, sync::Mutex};
 
@@ -9,6 +11,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE rss_feeds ADD COLUMN subject_id INTEGER",
     // v2：条目详情缓存——消除周表卡片的 N+1 详情请求，离线时也可回退。
     "CREATE TABLE IF NOT EXISTS subject_details(subject_id INTEGER PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL)",
+    // v3：同步队列版本号——防止旧请求在写回成功后删除并发产生的新修改。
+    "ALTER TABLE sync_queue ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+    // v4：下载任务文件清单——持久化任务内所有文件，保障重启后选集与安全清理。
+    "ALTER TABLE downloads ADD COLUMN files_json TEXT",
 ];
 
 fn apply_migrations(connection: &Connection) -> Result<(), String> {
@@ -44,6 +50,14 @@ pub fn canonical_download_source_key(source: &str) -> String {
     }
     // HTTP path/query can be case-sensitive (including signed token values).
     source.to_owned()
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadFileDetails {
+    pub source: String,
+    pub output_path: String,
+    pub playback_path: Option<String>,
+    pub files: Option<Vec<StoredFileInfo>>,
 }
 
 pub struct Database(pub Mutex<Connection>);
@@ -525,7 +539,7 @@ impl Database {
         source: &str,
         source_key: &str,
     ) -> Result<(), String> {
-        self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO downloads(id,title,episode,source,source_key,progress,down_speed,up_speed,state,output_path,created_at) VALUES(?1,?2,?3,?4,?5,0,0,0,?6,?7,?8)",params![task.id,task.title,task.episode,source,source_key,task.state,task.output_path,chrono::Utc::now().to_rfc3339()]).map_err(|e|e.to_string())?;
+        self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO downloads(id,title,episode,source,source_key,progress,down_speed,up_speed,state,output_path,created_at,playback_path) VALUES(?1,?2,?3,?4,?5,0,0,0,?6,?7,?8,?9)",params![task.id,task.title,task.episode,source,source_key,task.state,task.output_path,chrono::Utc::now().to_rfc3339(),task.playback_path]).map_err(|e|e.to_string())?;
         Ok(())
     }
     pub fn download_by_source_key(&self, source_key: &str) -> Result<Option<DownloadTask>, String> {
@@ -599,6 +613,7 @@ impl Database {
     }
 
     /// (source, output_path, playback_path)：播放回退恢复会话时使用。
+    #[allow(dead_code)]
     pub fn download_by_id(
         &self,
         id: &str,
@@ -620,6 +635,44 @@ impl Database {
             Err(error) => Err(error.to_string()),
         }
     }
+
+    pub fn save_download_files(&self, id: &str, files: &[StoredFileInfo]) -> Result<(), String> {
+        let payload = serde_json::to_string(files).map_err(|e| e.to_string())?;
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "UPDATE downloads SET files_json=?2 WHERE id=?1",
+                params![id, payload],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn download_files_and_paths(
+        &self,
+        id: &str,
+    ) -> Result<Option<DownloadFileDetails>, String> {
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        match connection.query_row(
+            "SELECT source,output_path,playback_path,files_json FROM downloads WHERE id=?1",
+            [id],
+            |row| {
+                let files_json: Option<String> = row.get(3)?;
+                let files = files_json.and_then(|json_str| serde_json::from_str(&json_str).ok());
+                Ok(DownloadFileDetails {
+                    source: row.get(0)?,
+                    output_path: row.get(1)?,
+                    playback_path: row.get(2)?,
+                    files,
+                })
+            },
+        ) {
+            Ok(found) => Ok(Some(found)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
     /// (id, source, state, output_path)：重启恢复下载会话时使用。
     pub fn restorable_downloads(&self) -> Result<Vec<(String, String, String, String)>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
@@ -633,10 +686,12 @@ impl Database {
             .map_err(|e| e.to_string())
     }
 
+    #[allow(dead_code)]
     pub fn set_collection(&self, subject_id: i64, collection: &str) -> Result<(), String> {
         self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO local_collections(subject_id,collection,updated_at) VALUES(?1,?2,?3) ON CONFLICT(subject_id) DO UPDATE SET collection=excluded.collection,updated_at=excluded.updated_at",params![subject_id,collection,chrono::Utc::now().to_rfc3339()]).map_err(|e|e.to_string())?;
         Ok(())
     }
+    #[allow(dead_code)]
     pub fn set_collection_progress(
         &self,
         subject_id: i64,
@@ -646,6 +701,146 @@ impl Database {
         self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO local_collections(subject_id,collection,watched,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(subject_id) DO UPDATE SET collection=excluded.collection,watched=excluded.watched,updated_at=excluded.updated_at",params![subject_id,collection,watched,chrono::Utc::now().to_rfc3339()]).map_err(|e|e.to_string())?;
         Ok(())
     }
+
+    /// 更新收藏状态。若 enqueue 为 true，在同一事务内将最新的 (collection, watched) 入队到 sync_queue。
+    /// 保留已有的观看集数，不会被置空。
+    pub fn set_collection_and_sync(
+        &self,
+        subject_id: i64,
+        collection: &str,
+        enqueue: bool,
+    ) -> Result<i64, String> {
+        let mut conn = self.0.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let watched: i64 = tx
+            .query_row(
+                "SELECT watched FROM local_collections WHERE subject_id=?1",
+                [subject_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        tx.execute(
+            "INSERT INTO local_collections(subject_id,collection,watched,updated_at)
+             VALUES(?1,?2,?3,?4)
+             ON CONFLICT(subject_id) DO UPDATE SET
+                 collection=excluded.collection,
+                 watched=excluded.watched,
+                 updated_at=excluded.updated_at",
+            params![subject_id, collection, watched, now],
+        )
+        .map_err(|e| e.to_string())?;
+
+        if enqueue {
+            tx.execute(
+                "INSERT INTO sync_queue(subject_id,collection,ep,attempts,next_attempt_at,updated_at,version)
+                 VALUES(?1,?2,?3,0,?4,?4,1)
+                 ON CONFLICT(subject_id) DO UPDATE SET
+                     collection=excluded.collection,
+                     ep=excluded.ep,
+                     attempts=0,
+                     version=sync_queue.version+1,
+                     next_attempt_at=excluded.next_attempt_at,
+                     updated_at=excluded.updated_at",
+                params![subject_id, collection, watched, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(watched)
+    }
+
+    /// 更新观看集数。若尚未收藏则默认“doing”。
+    /// 若 enqueue 为 true，在同一事务内将最新的 (collection, watched) 入队到 sync_queue。
+    pub fn set_progress_and_sync(
+        &self,
+        subject_id: i64,
+        watched: i64,
+        enqueue: bool,
+    ) -> Result<String, String> {
+        let mut conn = self.0.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let collection: String = tx
+            .query_row(
+                "SELECT collection FROM local_collections WHERE subject_id=?1",
+                [subject_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "doing".to_string());
+
+        tx.execute(
+            "INSERT INTO local_collections(subject_id,collection,watched,updated_at)
+             VALUES(?1,?2,?3,?4)
+             ON CONFLICT(subject_id) DO UPDATE SET
+                 collection=excluded.collection,
+                 watched=excluded.watched,
+                 updated_at=excluded.updated_at",
+            params![subject_id, &collection, watched, now],
+        )
+        .map_err(|e| e.to_string())?;
+
+        if enqueue {
+            tx.execute(
+                "INSERT INTO sync_queue(subject_id,collection,ep,attempts,next_attempt_at,updated_at,version)
+                 VALUES(?1,?2,?3,0,?4,?4,1)
+                 ON CONFLICT(subject_id) DO UPDATE SET
+                     collection=excluded.collection,
+                     ep=excluded.ep,
+                     attempts=0,
+                     version=sync_queue.version+1,
+                     next_attempt_at=excluded.next_attempt_at,
+                     updated_at=excluded.updated_at",
+                params![subject_id, &collection, watched, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(collection)
+    }
+
+    /// 从 Bangumi 导入收藏。在单个事务中检查待同步队列：
+    /// 若条目本地有待同步改动（在 sync_queue 中存在），保留本地状态与集数，不被云端旧数据覆盖。
+    pub fn import_cloud_collections(&self, items: &[(i64, String, i64)]) -> Result<usize, String> {
+        let mut conn = self.0.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut imported = 0;
+        {
+            let mut pending_stmt = tx
+                .prepare("SELECT DISTINCT subject_id FROM sync_queue")
+                .map_err(|e| e.to_string())?;
+            let pending_ids: std::collections::HashSet<i64> = pending_stmt
+                .query_map([], |row| row.get(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<std::collections::HashSet<i64>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            let mut upsert_stmt = tx
+                .prepare(
+                    "INSERT INTO local_collections(subject_id,collection,watched,updated_at)
+                     VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(subject_id) DO UPDATE SET
+                         collection=excluded.collection,
+                         watched=excluded.watched,
+                         updated_at=excluded.updated_at",
+                )
+                .map_err(|e| e.to_string())?;
+
+            for (subject_id, collection, watched) in items {
+                if pending_ids.contains(subject_id) {
+                    continue;
+                }
+                upsert_stmt
+                    .execute(params![subject_id, collection, watched, now])
+                    .map_err(|e| e.to_string())?;
+                imported += 1;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(imported)
+    }
+    #[allow(dead_code)]
     pub fn collection_state(&self, subject_id: i64) -> Result<Option<(String, i64)>, String> {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
         match connection.query_row(
@@ -755,7 +950,8 @@ impl Database {
         Ok(())
     }
 
-    /// 同一条目的待同步改动只保留最新一份（UNIQUE subject_id），避免乱序写回。
+    /// 同一条目的待同步改动只保留最新一份（UNIQUE subject_id），重新入队递增版本号。
+    #[allow(dead_code)]
     pub fn enqueue_collection_sync(
         &self,
         subject_id: i64,
@@ -763,7 +959,7 @@ impl Database {
         ep: Option<i64>,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO sync_queue(subject_id,collection,ep,attempts,next_attempt_at,updated_at) VALUES(?1,?2,?3,0,?4,?4) ON CONFLICT(subject_id) DO UPDATE SET collection=excluded.collection,ep=excluded.ep,attempts=0,next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at",params![subject_id,collection,ep,now]).map_err(|e| e.to_string())?;
+        self.0.lock().map_err(|e|e.to_string())?.execute("INSERT INTO sync_queue(subject_id,collection,ep,attempts,next_attempt_at,updated_at,version) VALUES(?1,?2,?3,0,?4,?4,1) ON CONFLICT(subject_id) DO UPDATE SET collection=excluded.collection,ep=excluded.ep,attempts=0,version=sync_queue.version+1,next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at",params![subject_id,collection,ep,now]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -772,7 +968,7 @@ impl Database {
         let connection = self.0.lock().map_err(|e| e.to_string())?;
         let mut query = connection
             .prepare(
-                "SELECT id,subject_id,collection,ep,attempts FROM sync_queue
+                "SELECT id,subject_id,collection,ep,attempts,version FROM sync_queue
                  WHERE next_attempt_at<=?1 ORDER BY updated_at LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
@@ -784,6 +980,7 @@ impl Database {
                     collection: row.get(2)?,
                     ep: row.get(3)?,
                     attempts: row.get(4)?,
+                    version: row.get(5)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -794,28 +991,34 @@ impl Database {
     pub fn mark_sync_attempt(
         &self,
         id: i64,
+        version: i64,
         attempts: i64,
         next_attempt_at: &str,
         last_error: &str,
-    ) -> Result<(), String> {
-        self.0
+    ) -> Result<bool, String> {
+        let rows = self
+            .0
             .lock()
             .map_err(|e| e.to_string())?
             .execute(
-                "UPDATE sync_queue SET attempts=?2,next_attempt_at=?3,last_error=?4,updated_at=?5 WHERE id=?1",
-                params![id, attempts, next_attempt_at, last_error, chrono::Utc::now().to_rfc3339()],
+                "UPDATE sync_queue SET attempts=?3,next_attempt_at=?4,last_error=?5,updated_at=?6 WHERE id=?1 AND version=?2",
+                params![id, version, attempts, next_attempt_at, last_error, chrono::Utc::now().to_rfc3339()],
             )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(rows > 0)
     }
 
-    pub fn remove_sync_entry(&self, id: i64) -> Result<(), String> {
-        self.0
+    pub fn remove_sync_entry(&self, id: i64, version: i64) -> Result<bool, String> {
+        let rows = self
+            .0
             .lock()
             .map_err(|e| e.to_string())?
-            .execute("DELETE FROM sync_queue WHERE id=?1", [id])
+            .execute(
+                "DELETE FROM sync_queue WHERE id=?1 AND version=?2",
+                params![id, version],
+            )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(rows > 0)
     }
 
     pub fn expire_all_sync_entries(&self) -> Result<(), String> {
@@ -863,6 +1066,7 @@ pub struct SyncEntry {
     pub collection: String,
     pub ep: Option<i64>,
     pub attempts: i64,
+    pub version: i64,
 }
 
 #[cfg(test)]
@@ -1145,13 +1349,16 @@ mod tests {
         assert_eq!(entry.ep, Some(12));
         assert_eq!(entry.attempts, 0, "重新入队要重置退避计数");
         // 失败进入退避：到期时间推到远期后不再被取出。
-        db.mark_sync_attempt(
-            entry.id,
-            1,
-            "2999-01-01T00:00:00+00:00",
-            "Bangumi 同步失败：500",
-        )
-        .unwrap();
+        assert!(
+            db.mark_sync_attempt(
+                entry.id,
+                entry.version,
+                1,
+                "2999-01-01T00:00:00+00:00",
+                "Bangumi 同步失败：500",
+            )
+            .unwrap()
+        );
         assert!(
             db.due_sync_entries(10)
                 .unwrap()
@@ -1164,7 +1371,301 @@ mod tests {
         assert!(last_attempt_at.is_some());
         db.expire_all_sync_entries().unwrap();
         assert_eq!(db.due_sync_entries(10).unwrap().len(), 2);
-        db.remove_sync_entry(entry.id).unwrap();
+        assert!(db.remove_sync_entry(entry.id, entry.version).unwrap());
         assert_eq!(db.pending_sync_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn sync_queue_versioning_prevents_stale_deletion_and_overwrite() {
+        let db = db();
+        db.enqueue_collection_sync(42, "doing", Some(1)).unwrap();
+        let entry_v1 = db
+            .due_sync_entries(10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.subject_id == 42)
+            .unwrap();
+        assert_eq!(entry_v1.version, 1);
+
+        // 用户在请求发送期间再次修改进度或状态，版本号递增为 2
+        db.enqueue_collection_sync(42, "doing", Some(2)).unwrap();
+        let entry_v2 = db
+            .due_sync_entries(10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.subject_id == 42)
+            .unwrap();
+        assert_eq!(entry_v2.version, 2);
+        assert_eq!(entry_v2.ep, Some(2));
+
+        // 旧版本的写回成功结果不能删除新版本记录
+        let deleted = db.remove_sync_entry(entry_v1.id, entry_v1.version).unwrap();
+        assert!(!deleted, "旧版本删除应返回 false 且不删除记录");
+        assert_eq!(db.pending_sync_count().unwrap(), 1);
+
+        // 旧版本的失败结果不能覆写新版本的重试与错误状态
+        let updated = db
+            .mark_sync_attempt(
+                entry_v1.id,
+                entry_v1.version,
+                5,
+                "2999-01-01T00:00:00+00:00",
+                "old error",
+            )
+            .unwrap();
+        assert!(!updated, "旧版本重试标记应返回 false");
+        let current = db
+            .due_sync_entries(10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.subject_id == 42)
+            .unwrap();
+        assert_eq!(current.attempts, 0, "新版本重试次数依然为 0");
+
+        // 正确版本号成功删除
+        let deleted_v2 = db.remove_sync_entry(entry_v2.id, entry_v2.version).unwrap();
+        assert!(deleted_v2);
+        assert_eq!(db.pending_sync_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn import_preserves_pending_sync_subjects() {
+        let db = db();
+        // 本地修改了番剧 101 的进度并入队
+        db.set_progress_and_sync(101, 7, true).unwrap();
+        // 本地未修改番剧 102
+        db.set_collection_progress(102, "wish", 0).unwrap();
+
+        // 模拟从云端拉取全量收藏：云端 101 仍是旧状态 (wish, 0)，云端 102 变为 (doing, 2)
+        let cloud_items = vec![(101, "wish".to_string(), 0), (102, "doing".to_string(), 2)];
+        let imported = db.import_cloud_collections(&cloud_items).unwrap();
+        assert_eq!(imported, 1, "只导入没有待同步改动的条目");
+
+        let (c101, w101) = db.collection_state(101).unwrap().unwrap();
+        assert_eq!(c101, "doing", "待同步条目本地状态不应被云端覆盖");
+        assert_eq!(w101, 7, "待同步条目本地进度不应被云端覆盖");
+
+        let (c102, w102) = db.collection_state(102).unwrap().unwrap();
+        assert_eq!(c102, "doing");
+        assert_eq!(w102, 2);
+    }
+
+    #[test]
+    fn collection_and_progress_atomic_updates_preserve_both() {
+        let db = db();
+        // 1. 先修改集数为 5
+        let coll = db.set_progress_and_sync(202, 5, true).unwrap();
+        assert_eq!(coll, "doing");
+        let entry = db
+            .due_sync_entries(10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.subject_id == 202)
+            .unwrap();
+        assert_eq!(entry.collection, "doing");
+        assert_eq!(entry.ep, Some(5));
+
+        // 2. 再切换收藏状态为 collect（看过）
+        let watched = db.set_collection_and_sync(202, "collect", true).unwrap();
+        assert_eq!(watched, 5, "集数依然为 5");
+        let entry2 = db
+            .due_sync_entries(10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.subject_id == 202)
+            .unwrap();
+        assert_eq!(entry2.collection, "collect");
+        assert_eq!(entry2.ep, Some(5), "切换状态不会清除已有集数");
+
+        // 3. 再修改集数为 12
+        let coll2 = db.set_progress_and_sync(202, 12, true).unwrap();
+        assert_eq!(
+            coll2, "collect",
+            "集数修改保留已有 collect 状态，不回退到 doing"
+        );
+        let entry3 = db
+            .due_sync_entries(10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.subject_id == 202)
+            .unwrap();
+        assert_eq!(entry3.collection, "collect");
+        assert_eq!(entry3.ep, Some(12));
+    }
+
+    #[test]
+    fn download_files_json_persistence_and_query() {
+        let db = db();
+        let task = DownloadTask {
+            id: "task_files_1".into(),
+            title: "合集测试".into(),
+            episode: "01-12".into(),
+            progress: 1.0,
+            down_speed: 0,
+            up_speed: 0,
+            state: "completed".into(),
+            output_path: "C:\\Downloads\\Mizuki".into(),
+            playback_path: Some("C:\\Downloads\\Mizuki\\ep01.mp4".into()),
+        };
+        db.add_download(&task, "magnet:?xt=urn:btih:xyz", "xyz")
+            .unwrap();
+
+        let files = vec![
+            StoredFileInfo {
+                relative_path: "ep01.mp4".into(),
+                len: 1024 * 1024 * 300,
+            },
+            StoredFileInfo {
+                relative_path: "ep02.mp4".into(),
+                len: 1024 * 1024 * 310,
+            },
+        ];
+        db.save_download_files("task_files_1", &files).unwrap();
+
+        let found = db
+            .download_files_and_paths("task_files_1")
+            .unwrap()
+            .expect("found task");
+        assert_eq!(found.source, "magnet:?xt=urn:btih:xyz");
+        assert_eq!(found.output_path, "C:\\Downloads\\Mizuki");
+        assert_eq!(
+            found.playback_path.as_deref(),
+            Some("C:\\Downloads\\Mizuki\\ep01.mp4")
+        );
+        let stored = found.files.expect("stored files");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].relative_path, "ep01.mp4");
+        assert_eq!(stored[1].len, 1024 * 1024 * 310);
+    }
+
+    #[test]
+    fn download_queue_state_persistence() {
+        let db = db();
+        let task = DownloadTask {
+            id: "queued_task_1".into(),
+            title: "排队任务".into(),
+            episode: "01".into(),
+            progress: 0.0,
+            down_speed: 0,
+            up_speed: 0,
+            state: "queued".into(),
+            output_path: "C:\\Downloads\\Mizuki".into(),
+            playback_path: None,
+        };
+        db.add_download(&task, "magnet:?xt=urn:btih:que", "que")
+            .unwrap();
+
+        let restorable = db.restorable_downloads().unwrap();
+        let found = restorable
+            .iter()
+            .find(|(id, ..)| id == "queued_task_1")
+            .unwrap();
+        assert_eq!(
+            found.2, "queued",
+            "重启恢复查询必须保留 queued 原始状态，不得被设为 paused"
+        );
+    }
+
+    #[test]
+    fn safe_file_deletion_without_handle() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("mizuki_test_delete_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let sub_dir = temp_dir.join("anime_season_1");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let file1 = sub_dir.join("ep01.mp4");
+        let file2 = sub_dir.join("ep02.mp4");
+        let other_file = temp_dir.join("other_task.mp4");
+
+        std::fs::write(&file1, b"ep01 content").unwrap();
+        std::fs::write(&file2, b"ep02 content").unwrap();
+        std::fs::write(&other_file, b"other content").unwrap();
+
+        let files = vec![
+            StoredFileInfo {
+                relative_path: "anime_season_1/ep01.mp4".into(),
+                len: 12,
+            },
+            StoredFileInfo {
+                relative_path: "anime_season_1/ep02.mp4".into(),
+                len: 12,
+            },
+            // 路径穿越攻击尝试
+            StoredFileInfo {
+                relative_path: "../outside.txt".into(),
+                len: 0,
+            },
+        ];
+
+        // 模拟 delete_download 中的无句柄安全删除逻辑
+        let base = &temp_dir;
+        let mut parent_dirs = std::collections::HashSet::new();
+        for file in files {
+            let rel = std::path::Path::new(&file.relative_path);
+            if rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                continue;
+            }
+            let full_path = base.join(rel);
+            if full_path.is_file() {
+                std::fs::remove_file(&full_path).unwrap();
+                if let Some(parent) = full_path.parent() {
+                    if parent.starts_with(base) && parent != base {
+                        parent_dirs.insert(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+        let mut dirs: Vec<_> = parent_dirs.into_iter().collect();
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.as_os_str().len()));
+        for dir in dirs {
+            if dir.starts_with(base) && dir != *base {
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
+
+        assert!(!file1.exists(), "目标文件 1 必须被删除");
+        assert!(!file2.exists(), "目标文件 2 必须被删除");
+        assert!(!sub_dir.exists(), "空子目录必须被安全清理");
+        assert!(other_file.exists(), "非该任务的文件绝不能被连带删除");
+        assert!(temp_dir.exists(), "共用下载目录本身绝不能被递归删除");
+
+        // 清理测试目录
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn offline_playback_file_selection_sorting() {
+        let stored_files = vec![
+            StoredFileInfo {
+                relative_path: "Ep10.mp4".into(),
+                len: 100,
+            },
+            StoredFileInfo {
+                relative_path: "Ep01.mp4".into(),
+                len: 100,
+            },
+            StoredFileInfo {
+                relative_path: "readme.txt".into(),
+                len: 10,
+            },
+            StoredFileInfo {
+                relative_path: "Ep02.mp4".into(),
+                len: 100,
+            },
+        ];
+
+        let mut video_files: Vec<_> = stored_files
+            .into_iter()
+            .filter(|f| crate::bt::is_video_file(std::path::Path::new(&f.relative_path)))
+            .collect();
+        assert_eq!(video_files.len(), 3, "文本等非视频文件必须被过滤");
+        video_files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        assert_eq!(video_files[0].relative_path, "Ep01.mp4");
+        assert_eq!(video_files[1].relative_path, "Ep02.mp4");
+        assert_eq!(video_files[2].relative_path, "Ep10.mp4");
     }
 }

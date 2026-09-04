@@ -20,7 +20,9 @@ pub(crate) struct AppState {
     pub(crate) download_path: PathBuf,
     pub(crate) trackers: tokio::sync::RwLock<Option<Vec<String>>>,
     pub(crate) download_gate: tokio::sync::Mutex<()>,
+    pub(crate) sync_gate: tokio::sync::Mutex<()>,
     pub(crate) sync_notify: tokio::sync::Notify,
+    pub(crate) promote_failures: Mutex<HashMap<String, Instant>>,
     pub(crate) settings: Mutex<AppSettings>,
     /// 封面缓存目录（img_cache/{subject_id}.jpg）。
     pub(crate) cover_dir: PathBuf,
@@ -45,5 +47,34 @@ impl AppState {
                 path.is_absolute().then_some(path)
             })
             .unwrap_or_else(|| self.download_path.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_state(temp_dir: &std::path::Path) -> Self {
+        let db = Database::open_in_memory().unwrap();
+        let bt_opts = librqbit::SessionOptions {
+            dht: None,
+            listen: None,
+            ..Default::default()
+        };
+        let bt = librqbit::Session::new_with_opts(temp_dir.to_path_buf(), bt_opts)
+            .await
+            .expect("bt session");
+        Self {
+            db,
+            client: reqwest::Client::new(),
+            bt,
+            handles: Mutex::new(HashMap::new()),
+            speed_samples: Mutex::new(HashMap::new()),
+            download_path: temp_dir.to_path_buf(),
+            trackers: tokio::sync::RwLock::new(None),
+            download_gate: tokio::sync::Mutex::new(()),
+            sync_gate: tokio::sync::Mutex::new(()),
+            sync_notify: tokio::sync::Notify::new(),
+            promote_failures: Mutex::new(HashMap::new()),
+            settings: Mutex::new(AppSettings::default()),
+            cover_dir: temp_dir.join("covers"),
+            bangumi_gate: tokio::sync::Semaphore::new(4),
+        }
     }
 }

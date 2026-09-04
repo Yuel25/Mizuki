@@ -140,7 +140,7 @@ export function DownloadsPage({ tasks, refresh }: { tasks: DownloadTask[]; refre
               </div>
               <strong>{Math.round(t.progress * 100)}%</strong>
               <div className="download-actions">
-                {t.state === "downloading" && (
+                {(t.state === "downloading" || t.state === "queued") && (
                   <button disabled={busy === t.id} onClick={() => action(t.id, "pause_download")}>
                     暂停
                   </button>
